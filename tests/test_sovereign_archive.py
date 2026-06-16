@@ -183,3 +183,82 @@ class TestMessageVersioning:
         edited = await adapter.record_message_edit(-100, 1, "A", None)
         assert edited is False
         assert await adapter.get_message_versions(-100, 1) == []
+
+
+# ============================================================
+# Epic B — Media reliability: status lifecycle + integrity
+# ============================================================
+
+
+async def _seed_media(adapter, media_id="m1", *, chat_id=-100, message_id=1, downloaded=0):
+    await adapter.upsert_chat({"id": chat_id, "type": "supergroup", "title": "T"})
+    await adapter.insert_message(
+        {"id": message_id, "chat_id": chat_id, "date": datetime(2026, 6, 15, tzinfo=UTC), "text": "m"}
+    )
+    await adapter.insert_media(
+        {"id": media_id, "message_id": message_id, "chat_id": chat_id, "type": "document", "downloaded": downloaded}
+    )
+
+
+class TestMediaReliability:
+    @pytest.mark.asyncio
+    async def test_insert_sets_status_from_downloaded_flag(self, adapter):
+        await _seed_media(adapter, "done", downloaded=1)
+        await _seed_media(adapter, "todo", message_id=2, downloaded=0)
+        statuses = {m["id"]: m["download_status"] for m in await adapter.get_media_for_chat(-100)}
+        assert statuses["done"] == "downloaded"
+        assert statuses["todo"] == "pending"
+
+    @pytest.mark.asyncio
+    async def test_mark_failed_tracks_attempts_and_error(self, adapter):
+        await _seed_media(adapter, "m1")
+        await adapter.mark_media_failed("m1", "timeout")
+        await adapter.mark_media_failed("m1", "connection reset")
+        rec = await adapter.get_media("m1")
+        assert rec["download_status"] == "failed"
+        assert rec["download_attempts"] == 2
+        assert rec["last_download_error"] == "connection reset"
+        assert rec["downloaded"] == 0  # never falsely marked complete
+
+    @pytest.mark.asyncio
+    async def test_mark_skipped_records_reason_without_marking_complete(self, adapter):
+        await _seed_media(adapter, "m1")
+        await adapter.mark_media_skipped("m1", "exceeds MAX_MEDIA_SIZE_MB")
+        rec = await adapter.get_media("m1")
+        assert rec["download_status"] == "skipped"
+        assert rec["skipped_reason"] == "exceeds MAX_MEDIA_SIZE_MB"
+        assert rec["downloaded"] == 0
+
+    @pytest.mark.asyncio
+    async def test_mark_downloaded_completes(self, adapter):
+        await _seed_media(adapter, "m1")
+        await adapter.mark_media_failed("m1", "x")
+        await adapter.mark_media_downloaded("m1", file_path="/data/m1.bin", content_hash="abc")
+        rec = await adapter.get_media("m1")
+        assert rec["download_status"] == "downloaded"
+        assert rec["downloaded"] == 1
+        assert rec["file_path"] == "/data/m1.bin"
+        assert rec["content_hash"] == "abc"
+
+    @pytest.mark.asyncio
+    async def test_integrity_summary_counts_by_status(self, adapter):
+        await _seed_media(adapter, "a", downloaded=1)
+        await _seed_media(adapter, "b", message_id=2)
+        await _seed_media(adapter, "c", message_id=3)
+        await adapter.mark_media_failed("b", "err")
+        await adapter.mark_media_skipped("c", "too big")
+        summary = await adapter.get_media_integrity_summary()
+        assert summary["downloaded"] == 1
+        assert summary["failed"] == 1
+        assert summary["skipped"] == 1
+        assert summary["total"] == 3
+        # incomplete = anything not successfully downloaded
+        assert summary["incomplete"] == 2
+
+    @pytest.mark.asyncio
+    async def test_get_failed_media_is_retry_queue(self, adapter):
+        await _seed_media(adapter, "a", downloaded=1)
+        await _seed_media(adapter, "b", message_id=2)
+        await adapter.mark_media_failed("b", "err")
+        failed_ids = {m["id"] for m in await adapter.get_failed_media()}
+        assert failed_ids == {"b"}

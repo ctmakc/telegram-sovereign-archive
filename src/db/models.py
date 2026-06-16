@@ -221,7 +221,14 @@ class Media(Base):
     height: Mapped[int | None] = mapped_column(Integer)
     duration: Mapped[int | None] = mapped_column(Integer)
     content_hash: Mapped[str | None] = mapped_column(String(64))  # SHA-256 hex digest
-    downloaded: Mapped[int] = mapped_column(Integer, default=0)  # 0 or 1
+    perceptual_hash: Mapped[str | None] = mapped_column(String(64))  # pHash for near-duplicate images
+    downloaded: Mapped[int] = mapped_column(Integer, default=0)  # 0 or 1 (kept for back-compat)
+    # Sovereign media reliability: richer lifecycle than the boolean `downloaded`.
+    # pending / downloaded / failed / skipped / unavailable
+    download_status: Mapped[str] = mapped_column(String(20), default="pending", server_default="pending")
+    download_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_download_error: Mapped[str | None] = mapped_column(Text)
+    skipped_reason: Mapped[str | None] = mapped_column(String(255))
     download_date: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, server_default=func.now())
 
@@ -242,6 +249,7 @@ class Media(Base):
         Index("idx_media_type", "type"),
         Index("idx_media_content_hash", "content_hash"),
         Index("idx_media_chat_type", "chat_id", "type"),
+        Index("idx_media_download_status", "download_status"),
     )
 
 
