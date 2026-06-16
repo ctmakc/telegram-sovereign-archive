@@ -1529,6 +1529,38 @@ class TestSovereignHistoryEndpoints(_WebTestBase):
 
 
 @_skip_unless_web
+class TestEvidenceExportEndpoint(_WebTestBase):
+    """PRD §21 evidence export endpoint, gated to accessible chats."""
+
+    async def test_export_returns_package(self):
+        self.mock_db.build_evidence_package = AsyncMock(
+            return_value={
+                "chat": {"id": -100, "title": "Deals"},
+                "messages": [{"id": 1}],
+                "manifest": {"message_count": 1, "content_sha256": "a" * 64},
+            }
+        )
+        async with self._client() as client:
+            resp = await client.get("/api/export/evidence?chat_id=-100")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["manifest"]["message_count"], 1)
+        self.mock_db.build_evidence_package.assert_awaited_once()
+
+    async def test_export_denies_out_of_scope_chat(self):
+        web_main.AUTH_ENABLED = True
+        token = "scoped-export"
+        web_main._sessions[token] = web_main.SessionData(
+            username="v", role="viewer", created_at=time.time(), allowed_chat_ids={999}
+        )
+        self.mock_db.build_evidence_package = AsyncMock(return_value={})
+        async with self._client() as client:
+            resp = await client.get("/api/export/evidence?chat_id=-100", cookies={"viewer_auth": token})
+        self.assertEqual(resp.status_code, 403)
+        self.mock_db.build_evidence_package.assert_not_called()
+
+
+@_skip_unless_web
 class TestIntegrityStatusEndpoint(_WebTestBase):
     """Epic E: integrity report endpoint."""
 

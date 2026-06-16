@@ -285,6 +285,58 @@ class TestGlobalSearch:
         assert {(h["chat_id"], h["id"]) for h in hits} == {(-100, 2)}
 
 
+class TestEvidenceExport:
+    """PRD §21: evidence package with tamper-evident hash manifest."""
+
+    async def _seed(self, adapter):
+        await adapter.upsert_chat({"id": -100, "type": "supergroup", "title": "Deals"})
+        await adapter.insert_message(
+            {"id": 1, "chat_id": -100, "date": datetime(2026, 6, 1, tzinfo=UTC), "text": "hello"}
+        )
+        await adapter.insert_message(
+            {"id": 2, "chat_id": -100, "date": datetime(2026, 6, 2, tzinfo=UTC), "text": "A"}
+        )
+        await adapter.insert_message(
+            {"id": 3, "chat_id": -100, "date": datetime(2026, 6, 3, tzinfo=UTC), "text": "bye"}
+        )
+        await adapter.record_message_edit(-100, 2, "B", None)
+        await adapter.mark_message_deleted(-100, 3)
+
+    @pytest.mark.asyncio
+    async def test_package_captures_history_and_is_deterministic(self, adapter):
+        await self._seed(adapter)
+        pkg = await adapter.build_evidence_package(-100)
+
+        assert pkg["chat"]["id"] == -100
+        assert pkg["chat"]["title"] == "Deals"
+        assert pkg["manifest"]["message_count"] == 3
+        assert len(pkg["manifest"]["content_sha256"]) == 64
+        assert pkg["manifest"]["non_modification_statement"]
+
+        m2 = next(m for m in pkg["messages"] if m["id"] == 2)
+        assert [v["text"] for v in m2["versions"]] == ["A"]  # prior text preserved
+        m3 = next(m for m in pkg["messages"] if m["id"] == 3)
+        assert m3["is_deleted_in_telegram"] == 1  # deleted-but-preserved
+
+        # deterministic: identical content → identical hash (manifest timestamp excluded)
+        pkg2 = await adapter.build_evidence_package(-100)
+        assert pkg2["manifest"]["content_sha256"] == pkg["manifest"]["content_sha256"]
+
+    @pytest.mark.asyncio
+    async def test_tamper_changes_hash(self, adapter):
+        await self._seed(adapter)
+        h1 = (await adapter.build_evidence_package(-100))["manifest"]["content_sha256"]
+        await adapter.record_message_edit(-100, 1, "hello (tampered)", None)
+        h2 = (await adapter.build_evidence_package(-100))["manifest"]["content_sha256"]
+        assert h1 != h2
+
+    @pytest.mark.asyncio
+    async def test_date_range_filters(self, adapter):
+        await self._seed(adapter)
+        pkg = await adapter.build_evidence_package(-100, start_date=datetime(2026, 6, 2, tzinfo=UTC))
+        assert {m["id"] for m in pkg["messages"]} == {2, 3}
+
+
 class TestIntegrityChecks:
     """Epic E: data-integrity checks (PRD §19.3)."""
 
