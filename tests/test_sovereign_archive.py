@@ -185,6 +185,37 @@ class TestMessageVersioning:
         assert await adapter.get_message_versions(-100, 1) == []
 
 
+class TestSovereignStats:
+    """Dashboard counters proving the append-only guarantees are working."""
+
+    @pytest.mark.asyncio
+    async def test_stats_count_preserved_deleted_and_versioned(self, adapter):
+        await _seed_message(adapter, message_id=1, text="kept")
+        await _seed_message(adapter, message_id=2, text="A")
+        await _seed_message(adapter, message_id=3, text="untouched")
+        # one deleted-but-preserved
+        await adapter.mark_message_deleted(-100, 1)
+        # one edited twice (2 versions)
+        await adapter.record_message_edit(-100, 2, "B", None)
+        await adapter.record_message_edit(-100, 2, "C", None)
+
+        stats = await adapter.get_sovereign_stats()
+        assert stats["deleted_preserved"] == 1
+        assert stats["messages_with_history"] == 1
+        assert stats["total_versions"] == 2
+        # events: 1 deleted + 2 edited
+        assert stats["events_total"] == 3
+
+    @pytest.mark.asyncio
+    async def test_stats_empty_archive_is_all_zero(self, adapter):
+        await adapter.upsert_chat({"id": -100, "type": "supergroup", "title": "T"})
+        stats = await adapter.get_sovereign_stats()
+        assert stats["deleted_preserved"] == 0
+        assert stats["messages_with_history"] == 0
+        assert stats["total_versions"] == 0
+        assert stats["events_total"] == 0
+
+
 # ============================================================
 # Epic B — Media reliability: status lifecycle + integrity
 # ============================================================

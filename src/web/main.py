@@ -1445,6 +1445,22 @@ async def get_messages(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@app.get("/api/sovereign/status")
+async def get_sovereign_status(user: UserContext = Depends(require_auth)):
+    """Evidence-grade dashboard summary: how much local truth the archive has
+    preserved (deletions kept, edit history captured) plus media integrity.
+    """
+    try:
+        stats = await db.get_sovereign_stats()
+        stats["media"] = await db.get_media_integrity_summary()
+        return stats
+    except Exception as e:
+        logger.error(f"Error fetching sovereign status: {e}", exc_info=True)
+        if _is_db_connection_error(e):
+            raise HTTPException(status_code=503, detail="Database temporarily unavailable")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 @app.get("/api/chats/{chat_id}/messages/{message_id}/versions")
 async def get_message_version_history(
     chat_id: int, message_id: int, user: UserContext = Depends(require_auth)
