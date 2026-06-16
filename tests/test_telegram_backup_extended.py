@@ -788,14 +788,15 @@ class TestSyncDeletionsAndEdits(unittest.TestCase):
         self.backup.client.get_messages.assert_not_awaited()
 
     def test_deleted_message_removed_from_db(self):
-        """Remote message returning None triggers delete_message."""
+        """Remote message returning None triggers a tombstone under SAFE_ARCHIVE_MODE (default)."""
+        self.backup.config.safe_archive_mode = True
         self.backup.db.get_messages_sync_data = AsyncMock(return_value={1: None})
         self.backup.client.get_messages = AsyncMock(return_value=[None])
         entity = MagicMock()
 
         _run(self.backup._sync_deletions_and_edits(100, entity))
 
-        self.backup.db.delete_message.assert_awaited_once_with(100, 1)
+        self.backup.db.mark_message_deleted.assert_awaited_once_with(100, 1)
 
     def test_edited_message_updated_in_db(self):
         """Remote message with different edit_date triggers update."""
@@ -808,7 +809,8 @@ class TestSyncDeletionsAndEdits(unittest.TestCase):
 
         _run(self.backup._sync_deletions_and_edits(100, entity))
 
-        self.backup.db.update_message_text.assert_awaited_once()
+        # SAFE_ARCHIVE_MODE (default): edit is versioned, not overwritten.
+        self.backup.db.record_message_edit.assert_awaited_once()
 
     def test_unedited_message_not_updated(self):
         """Message with no edit_date does not trigger update."""
@@ -820,6 +822,40 @@ class TestSyncDeletionsAndEdits(unittest.TestCase):
 
         _run(self.backup._sync_deletions_and_edits(100, entity))
 
+        self.backup.db.update_message_text.assert_not_awaited()
+
+    def test_safe_mode_tombstones_deletion_instead_of_removing(self):
+        """Under SAFE_ARCHIVE_MODE the scheduled sync tombstones, never destroys."""
+        self.backup.config.safe_archive_mode = True
+        self.backup.db.get_messages_sync_data = AsyncMock(return_value={1: None})
+        self.backup.client.get_messages = AsyncMock(return_value=[None])
+
+        _run(self.backup._sync_deletions_and_edits(100, MagicMock()))
+
+        self.backup.db.mark_message_deleted.assert_awaited_once_with(100, 1)
+        self.backup.db.delete_message.assert_not_awaited()
+
+    def test_non_safe_mode_hard_deletes(self):
+        self.backup.config.safe_archive_mode = False
+        self.backup.db.get_messages_sync_data = AsyncMock(return_value={1: None})
+        self.backup.client.get_messages = AsyncMock(return_value=[None])
+
+        _run(self.backup._sync_deletions_and_edits(100, MagicMock()))
+
+        self.backup.db.delete_message.assert_awaited_once_with(100, 1)
+        self.backup.db.mark_message_deleted.assert_not_awaited()
+
+    def test_safe_mode_versions_edit_instead_of_overwriting(self):
+        self.backup.config.safe_archive_mode = True
+        self.backup.db.get_messages_sync_data = AsyncMock(return_value={1: "2024-01-01 00:00:00"})
+        remote_msg = MagicMock()
+        remote_msg.edit_date = datetime(2024, 6, 15)
+        remote_msg.message = "updated text"
+        self.backup.client.get_messages = AsyncMock(return_value=[remote_msg])
+
+        _run(self.backup._sync_deletions_and_edits(100, MagicMock()))
+
+        self.backup.db.record_message_edit.assert_awaited_once()
         self.backup.db.update_message_text.assert_not_awaited()
 
     def test_batch_exception_does_not_crash(self):

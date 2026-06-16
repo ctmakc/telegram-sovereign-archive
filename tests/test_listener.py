@@ -247,6 +247,7 @@ class TestEventHandlers:
         config.validate_credentials = MagicMock()
         config.whitelist_mode = False
         config.chat_ids = set()
+        config.safe_archive_mode = True
         config.listen_edits = True
         config.listen_deletions = True
         config.listen_new_messages = True
@@ -266,6 +267,8 @@ class TestEventHandlers:
         db.get_all_chats = AsyncMock(return_value=[])
         db.update_message_text = AsyncMock()
         db.delete_message = AsyncMock()
+        db.record_message_edit = AsyncMock()
+        db.mark_message_deleted = AsyncMock()
         db.resolve_message_chat_id = AsyncMock(return_value=None)
         db.upsert_chat = AsyncMock()
         db.upsert_user = AsyncMock()
@@ -522,12 +525,14 @@ class TestEventHandlers:
 
         assert listener.stats["edits_received"] == 1
         assert listener.stats["edits_applied"] == 1
-        listener.db.update_message_text.assert_called_once_with(
+        # SAFE_ARCHIVE_MODE (default): edits are versioned, not overwritten.
+        listener.db.record_message_edit.assert_called_once_with(
             chat_id=-1001234567890,
             message_id=42,
             new_text="Updated text",
             edit_date=msg.edit_date,
         )
+        listener.db.update_message_text.assert_not_called()
 
     def test_on_message_edited_handles_none_text(self, listener_with_handlers):
         """Test edit handler treats None text as empty string."""
@@ -546,7 +551,7 @@ class TestEventHandlers:
         asyncio.run(handler(event))
 
         assert listener.stats["edits_applied"] == 1
-        call_kwargs = listener.db.update_message_text.call_args[1]
+        call_kwargs = listener.db.record_message_edit.call_args[1]
         assert call_kwargs["new_text"] == ""
 
     def test_on_message_edited_increments_error_on_exception(self, listener_with_handlers):
@@ -610,7 +615,9 @@ class TestEventHandlers:
 
         assert listener.stats["deletions_received"] == 2
         assert listener.stats["deletions_applied"] == 2
-        assert listener.db.delete_message.call_count == 2
+        # SAFE_ARCHIVE_MODE (default): deletions are tombstoned, not destroyed.
+        assert listener.db.mark_message_deleted.call_count == 2
+        listener.db.delete_message.assert_not_called()
 
     def test_on_message_deleted_resolves_chat_when_chat_id_none(self, listener_with_handlers, mock_db):
         """Test delete handler resolves chat_id from DB when event has None chat_id."""
@@ -678,6 +685,7 @@ class TestStatsTracking:
         config.validate_credentials = MagicMock()
         config.whitelist_mode = False
         config.chat_ids = set()
+        config.safe_archive_mode = True
         config.listen_edits = True
         config.listen_deletions = True
         config.listen_new_messages = True
@@ -697,6 +705,8 @@ class TestStatsTracking:
         db.get_all_chats = AsyncMock(return_value=[])
         db.update_message_text = AsyncMock()
         db.delete_message = AsyncMock()
+        db.record_message_edit = AsyncMock()
+        db.mark_message_deleted = AsyncMock()
         db.resolve_message_chat_id = AsyncMock(return_value=None)
         db.upsert_chat = AsyncMock()
         db.upsert_user = AsyncMock()

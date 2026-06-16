@@ -274,6 +274,22 @@ class Config:
         # in real-time instead of batch-checking on each backup run
         self.enable_listener = os.getenv("ENABLE_LISTENER", "false").lower() == "true"
 
+        # ── Sovereign Archive guardrails ───────────────────────────────────
+        # SAFE_ARCHIVE_MODE: master guardrail for evidence-grade / append-only
+        # behavior. When true (default), Telegram deletions become tombstones
+        # (the local row is preserved + flagged) instead of hard deletes, and
+        # edits append a version snapshot before overwriting the live text.
+        self.safe_archive_mode = _parse_bool(os.getenv("SAFE_ARCHIVE_MODE"), default=True)
+
+        # DELETE_LOCAL_ON_TELEGRAM_DELETE: opt-in mirror that physically removes
+        # the local copy when a message is deleted on Telegram. Forced OFF while
+        # SAFE_ARCHIVE_MODE is enabled — the guardrail overrides any request.
+        self.delete_local_on_telegram_delete = _parse_bool(
+            os.getenv("DELETE_LOCAL_ON_TELEGRAM_DELETE"), default=False
+        )
+        if self.safe_archive_mode:
+            self.delete_local_on_telegram_delete = False
+
         # Listener granular controls (only apply when ENABLE_LISTENER=true)
         # LISTEN_EDITS: Apply text edits to backed up messages (safe, just updates text)
         self.listen_edits = os.getenv("LISTEN_EDITS", "true").lower() == "true"

@@ -30,6 +30,8 @@ from .models import (
     ForumTopic,
     Media,
     Message,
+    MessageEvent,
+    MessageVersion,
     Metadata,
     Reaction,
     SyncStatus,
@@ -537,6 +539,65 @@ class DatabaseAdapter:
             await session.commit()
             logger.debug(f"Deleted message {message_id} from chat {chat_id}")
 
+    async def get_message(self, chat_id: int, message_id: int) -> dict[str, Any] | None:
+        """Fetch a single message as a dict, including sovereign tombstone fields."""
+        async with self.db_manager.async_session_factory() as session:
+            stmt = select(Message).where(and_(Message.chat_id == chat_id, Message.id == message_id))
+            message = (await session.execute(stmt)).scalar_one_or_none()
+            return self._message_to_dict(message) if message else None
+
+    async def mark_message_deleted(self, chat_id: int, message_id: int) -> bool:
+        """Tombstone a message deleted on Telegram WITHOUT removing local data.
+
+        Sets is_deleted_in_telegram + deleted_detected_at and records a 'deleted'
+        event. Idempotent: re-detecting a deletion preserves the original
+        timestamp and does not log a duplicate event. Media/reactions/versions are
+        deliberately left untouched. Returns True if a row was tombstoned now.
+        """
+        async with self.db_manager.async_session_factory() as session:
+            stmt = select(Message).where(and_(Message.chat_id == chat_id, Message.id == message_id))
+            message = (await session.execute(stmt)).scalar_one_or_none()
+            if message is None:
+                return False
+            if message.is_deleted_in_telegram:
+                return False  # already tombstoned — keep first-detected time, no dup event
+            now = datetime.utcnow()
+            message.is_deleted_in_telegram = 1
+            message.deleted_detected_at = now
+            message.last_seen_at = now
+            session.add(
+                MessageEvent(
+                    message_id=message_id,
+                    chat_id=chat_id,
+                    event_type="deleted",
+                    event_date=now,
+                    captured_at=now,
+                )
+            )
+            await session.commit()
+            logger.info(f"Tombstoned message {message_id} in chat {chat_id} (deleted on Telegram, preserved locally)")
+            return True
+
+    async def get_message_events(self, chat_id: int, message_id: int) -> list[dict[str, Any]]:
+        """Return the append-only event log for a message, oldest first."""
+        async with self.db_manager.async_session_factory() as session:
+            stmt = (
+                select(MessageEvent)
+                .where(and_(MessageEvent.chat_id == chat_id, MessageEvent.message_id == message_id))
+                .order_by(MessageEvent.id.asc())
+            )
+            result = await session.execute(stmt)
+            return [
+                {
+                    "id": e.id,
+                    "event_type": e.event_type,
+                    "event_date": e.event_date,
+                    "captured_at": e.captured_at,
+                    "raw_json": e.raw_json,
+                }
+                for e in result.scalars()
+            ]
+
     async def resolve_message_chat_id(self, message_id: int) -> int | None:
         """
         Find which chat a message belongs to.
@@ -567,6 +628,89 @@ class DatabaseAdapter:
             )
             await session.commit()
             logger.debug(f"Updated message {message_id} in chat {chat_id}")
+
+    async def record_message_edit(
+        self, chat_id: int, message_id: int, new_text: str, edit_date: datetime | None
+    ) -> bool:
+        """Apply an edit while preserving the full text history (append-only).
+
+        Before overwriting the live ``text``, the prior value is snapshotted into
+        ``message_versions`` (version 1 = oldest prior text). An 'edited' event is
+        logged. A no-op edit (text unchanged) bumps edit_date but creates no
+        version. Returns True if a new version was captured.
+        """
+        async with self.db_manager.async_session_factory() as session:
+            stmt = select(Message).where(and_(Message.chat_id == chat_id, Message.id == message_id))
+            message = (await session.execute(stmt)).scalar_one_or_none()
+            if message is None:
+                return False
+
+            now = datetime.utcnow()
+            if message.text == new_text:
+                # No textual change — still record that an edit occurred upstream.
+                message.edit_date = _strip_tz(edit_date)
+                message.last_seen_at = now
+                await session.commit()
+                return False
+
+            prior_text = message.text
+            max_version = (
+                await session.execute(
+                    select(func.max(MessageVersion.version_number)).where(
+                        and_(MessageVersion.chat_id == chat_id, MessageVersion.message_id == message_id)
+                    )
+                )
+            ).scalar()
+            next_version = (max_version or 0) + 1
+            content_hash = (
+                hashlib.sha256(prior_text.encode("utf-8")).hexdigest() if prior_text is not None else None
+            )
+            session.add(
+                MessageVersion(
+                    message_id=message_id,
+                    chat_id=chat_id,
+                    version_number=next_version,
+                    text=prior_text,
+                    edit_date=message.edit_date,
+                    content_hash=content_hash,
+                    captured_at=now,
+                )
+            )
+            message.text = new_text
+            message.edit_date = _strip_tz(edit_date)
+            message.last_seen_at = now
+            session.add(
+                MessageEvent(
+                    message_id=message_id,
+                    chat_id=chat_id,
+                    event_type="edited",
+                    event_date=_strip_tz(edit_date),
+                    captured_at=now,
+                )
+            )
+            await session.commit()
+            logger.debug(f"Versioned edit for message {message_id} in chat {chat_id} (v{next_version} preserved)")
+            return True
+
+    async def get_message_versions(self, chat_id: int, message_id: int) -> list[dict[str, Any]]:
+        """Return the preserved prior-text versions for a message, oldest first."""
+        async with self.db_manager.async_session_factory() as session:
+            stmt = (
+                select(MessageVersion)
+                .where(and_(MessageVersion.chat_id == chat_id, MessageVersion.message_id == message_id))
+                .order_by(MessageVersion.version_number.asc())
+            )
+            result = await session.execute(stmt)
+            return [
+                {
+                    "version_number": v.version_number,
+                    "text": v.text,
+                    "edit_date": v.edit_date,
+                    "content_hash": v.content_hash,
+                    "captured_at": v.captured_at,
+                }
+                for v in result.scalars()
+            ]
 
     async def backfill_is_outgoing(self, owner_id: int) -> None:
         """Backfill is_outgoing flag for messages sent by the owner."""
@@ -602,6 +746,10 @@ class DatabaseAdapter:
             "created_at": message.created_at,
             "is_outgoing": message.is_outgoing,
             "is_pinned": message.is_pinned,
+            "is_deleted_in_telegram": message.is_deleted_in_telegram,
+            "deleted_detected_at": message.deleted_detected_at,
+            "first_seen_at": message.first_seen_at,
+            "last_seen_at": message.last_seen_at,
         }
 
     async def get_chat_stats(self, chat_id: int) -> dict[str, Any]:
