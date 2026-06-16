@@ -262,3 +262,91 @@ class TestMediaReliability:
         await adapter.mark_media_failed("b", "err")
         failed_ids = {m["id"] for m in await adapter.get_failed_media()}
         assert failed_ids == {"b"}
+
+    @pytest.mark.asyncio
+    async def test_insert_media_persists_explicit_skipped_status_and_reason(self, adapter):
+        """A size-skipped download must be recorded as skipped with a visible reason."""
+        await adapter.upsert_chat({"id": -100, "type": "supergroup", "title": "T"})
+        await adapter.insert_message(
+            {"id": 1, "chat_id": -100, "date": datetime(2026, 6, 15, tzinfo=UTC), "text": "m"}
+        )
+        await adapter.insert_media(
+            {
+                "id": "big",
+                "message_id": 1,
+                "chat_id": -100,
+                "type": "document",
+                "file_size": 9_000_000_000,
+                "downloaded": False,
+                "download_status": "skipped",
+                "skipped_reason": "exceeds MAX_MEDIA_SIZE_MB",
+            }
+        )
+        rec = await adapter.get_media("big")
+        assert rec["download_status"] == "skipped"
+        assert rec["skipped_reason"] == "exceeds MAX_MEDIA_SIZE_MB"
+        assert rec["downloaded"] == 0
+
+
+class TestMediaSkipWiring:
+    """The backup's _process_media must record oversize files as skipped (not silently pending)."""
+
+    def _backup(self, max_bytes):
+        import asyncio  # noqa: F401
+        from unittest.mock import MagicMock
+
+        from src.telegram_backup import TelegramBackup
+
+        b = TelegramBackup.__new__(TelegramBackup)
+        b.config = MagicMock()
+        b.config.media_path = "/tmp/tsa_skip"
+        b.config.get_max_media_size_bytes = MagicMock(return_value=max_bytes)
+        b._get_media_type = MagicMock(return_value="document")
+        b._get_media_size = MagicMock(return_value=999_999_999)
+        return b
+
+    def test_oversize_media_is_marked_skipped_with_reason(self):
+        import asyncio
+        from unittest.mock import MagicMock
+
+        b = self._backup(max_bytes=1024)
+        msg = MagicMock()
+        msg.id = 5
+        msg.media = MagicMock()
+        msg.media.document = MagicMock()
+        msg.media.document.id = "d1"
+        msg.media.photo = None
+
+        result = asyncio.run(b._process_media(msg, -100))
+
+        assert result["downloaded"] is False
+        assert result["download_status"] == "skipped"
+        assert "MAX_MEDIA_SIZE" in result["skipped_reason"]
+
+    def test_failed_retry_records_failure_in_queue(self):
+        """A download that errors during retry must be marked failed (visible in retry queue)."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from src.telegram_backup import TelegramBackup
+
+        b = TelegramBackup.__new__(TelegramBackup)
+        b.config = MagicMock()
+        b.config.skip_media_chat_ids = set()
+        b.config.get_max_media_size_bytes = MagicMock(return_value=100 * 1024 * 1024)
+        b.db = AsyncMock()
+        b.db.get_pending_media_downloads = AsyncMock(
+            return_value=[{"id": "x", "message_id": 5, "chat_id": -100, "type": "document"}]
+        )
+        msg = MagicMock()
+        msg.id = 5
+        msg.media = MagicMock()
+        b.client = AsyncMock()
+        b.client.get_messages = AsyncMock(return_value=[msg])
+        b._process_media = AsyncMock(side_effect=RuntimeError("download boom"))
+
+        asyncio.run(b._retry_pending_media_downloads())
+
+        b.db.mark_media_failed.assert_awaited_once()
+        called_id = b.db.mark_media_failed.await_args.args[0]
+        assert called_id == "x"

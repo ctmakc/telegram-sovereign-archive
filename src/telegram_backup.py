@@ -957,6 +957,14 @@ class TelegramBackup:
                             skipped += 1
                     except Exception as e:
                         logger.debug(f"Retry failed for pending media: {e}")
+                        # Record the failure so it surfaces in the retry queue /
+                        # integrity report instead of looking like an untried item.
+                        media_record_id = record.get("id")
+                        if media_record_id is not None:
+                            try:
+                                await self.db.mark_media_failed(media_record_id, str(e))
+                            except Exception:  # never let bookkeeping mask the real error
+                                logger.debug("Could not record media failure status", exc_info=True)
                         failed += 1
 
             except Exception as e:
@@ -1734,6 +1742,9 @@ class TelegramBackup:
 
         if file_size > max_size:
             logger.debug(f"Skipping large media file: {file_size / 1024 / 1024:.2f} MB")
+            # Sovereign archive: a size skip is a technical limit, not a value
+            # judgment. Record it as an incomplete item (visible in the retry
+            # queue / integrity report) rather than silently leaving it pending.
             return {
                 "id": media_id,
                 "type": media_type,
@@ -1741,6 +1752,11 @@ class TelegramBackup:
                 "chat_id": chat_id,
                 "file_size": file_size,
                 "downloaded": False,
+                "download_status": "skipped",
+                "skipped_reason": (
+                    f"exceeds MAX_MEDIA_SIZE_MB ({file_size / 1024 / 1024:.1f} MB > "
+                    f"{max_size / 1024 / 1024:.1f} MB)"
+                ),
             }
 
         # Download media (with optional global deduplication)

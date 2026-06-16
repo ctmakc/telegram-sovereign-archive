@@ -814,6 +814,7 @@ class DatabaseAdapter:
                 "downloaded": 1 if media_data.get("downloaded") else 0,
                 "download_status": media_data.get("download_status")
                 or ("downloaded" if media_data.get("downloaded") else "pending"),
+                "skipped_reason": media_data.get("skipped_reason"),
                 "download_date": media_data.get("download_date"),
             }
 
