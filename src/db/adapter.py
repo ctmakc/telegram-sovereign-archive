@@ -810,7 +810,10 @@ class DatabaseAdapter:
                 "height": media_data.get("height"),
                 "duration": media_data.get("duration"),
                 "content_hash": media_data.get("content_hash"),
+                "perceptual_hash": media_data.get("perceptual_hash"),
                 "downloaded": 1 if media_data.get("downloaded") else 0,
+                "download_status": media_data.get("download_status")
+                or ("downloaded" if media_data.get("downloaded") else "pending"),
                 "download_date": media_data.get("download_date"),
             }
 
@@ -862,6 +865,7 @@ class DatabaseAdapter:
                     "file_path": m.file_path,
                     "file_size": m.file_size,
                     "downloaded": m.downloaded,
+                    "download_status": m.download_status,
                 }
                 for m in media_records
             ]
@@ -1078,6 +1082,108 @@ class DatabaseAdapter:
             stmt = update(Media).where(Media.id == media_id).values(file_path=file_path)
             await session.execute(stmt)
             await session.commit()
+
+    # ========== Media reliability (Epic B) ==========
+
+    async def get_media(self, media_id: str) -> dict[str, Any] | None:
+        """Fetch a single media record with full reliability metadata."""
+        async with self.db_manager.async_session_factory() as session:
+            media = (await session.execute(select(Media).where(Media.id == media_id))).scalar_one_or_none()
+            if media is None:
+                return None
+            return {
+                "id": media.id,
+                "message_id": media.message_id,
+                "chat_id": media.chat_id,
+                "type": media.type,
+                "file_path": media.file_path,
+                "file_name": media.file_name,
+                "file_size": media.file_size,
+                "content_hash": media.content_hash,
+                "perceptual_hash": media.perceptual_hash,
+                "downloaded": media.downloaded,
+                "download_status": media.download_status,
+                "download_attempts": media.download_attempts,
+                "last_download_error": media.last_download_error,
+                "skipped_reason": media.skipped_reason,
+                "download_date": media.download_date,
+            }
+
+    async def mark_media_downloaded(
+        self, media_id: str, file_path: str | None = None, content_hash: str | None = None
+    ) -> None:
+        """Mark media as successfully downloaded (clears failure/skip state)."""
+        values: dict[str, Any] = {
+            "downloaded": 1,
+            "download_status": "downloaded",
+            "last_download_error": None,
+            "skipped_reason": None,
+            "download_date": datetime.utcnow(),
+        }
+        if file_path is not None:
+            values["file_path"] = file_path
+        if content_hash is not None:
+            values["content_hash"] = content_hash
+        async with self.db_manager.async_session_factory() as session:
+            await session.execute(update(Media).where(Media.id == media_id).values(**values))
+            await session.commit()
+
+    async def mark_media_failed(self, media_id: str, error: str | None = None) -> None:
+        """Record a failed download attempt: status=failed, attempts++, last error kept."""
+        async with self.db_manager.async_session_factory() as session:
+            media = (await session.execute(select(Media).where(Media.id == media_id))).scalar_one_or_none()
+            if media is None:
+                return
+            media.download_status = "failed"
+            media.download_attempts = (media.download_attempts or 0) + 1
+            media.last_download_error = error
+            media.downloaded = 0
+            await session.commit()
+
+    async def mark_media_skipped(self, media_id: str, reason: str) -> None:
+        """Mark media skipped (e.g. over size limit) — incomplete, not destroyed."""
+        async with self.db_manager.async_session_factory() as session:
+            await session.execute(
+                update(Media)
+                .where(Media.id == media_id)
+                .values(download_status="skipped", skipped_reason=reason, downloaded=0)
+            )
+            await session.commit()
+
+    async def get_media_by_status(self, status: str) -> list[dict[str, Any]]:
+        """Return media records in a given download_status."""
+        async with self.db_manager.async_session_factory() as session:
+            result = await session.execute(select(Media).where(Media.download_status == status))
+            return [{"id": m.id, "chat_id": m.chat_id, "message_id": m.message_id, "type": m.type} for m in result.scalars()]
+
+    async def get_failed_media(self) -> list[dict[str, Any]]:
+        """The retry queue: media whose last download attempt failed."""
+        return await self.get_media_by_status("failed")
+
+    async def get_media_integrity_summary(self) -> dict[str, int]:
+        """Counts of media by download_status plus total and incomplete totals.
+
+        'incomplete' = any archive item that is not successfully downloaded
+        (pending/failed/skipped/unavailable) — surfaced so nothing silently
+        looks complete.
+        """
+        async with self.db_manager.async_session_factory() as session:
+            result = await session.execute(
+                select(Media.download_status, func.count()).group_by(Media.download_status)
+            )
+            counts = {status: count for status, count in result.all()}
+            total = sum(counts.values())
+            downloaded = counts.get("downloaded", 0)
+            summary = {
+                "total": total,
+                "downloaded": downloaded,
+                "pending": counts.get("pending", 0),
+                "failed": counts.get("failed", 0),
+                "skipped": counts.get("skipped", 0),
+                "unavailable": counts.get("unavailable", 0),
+                "incomplete": total - downloaded,
+            }
+            return summary
 
     # ========== Reaction Operations ==========
 
