@@ -1445,6 +1445,40 @@ async def get_messages(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@app.get("/api/export/evidence")
+async def export_evidence(
+    chat_id: int,
+    user: UserContext = Depends(require_auth),
+    start_date: str | None = None,
+    end_date: str | None = None,
+):
+    """PRD §21: export a chat (optionally date-ranged) as an evidence package with
+    full edit history, deletion status, media hashes and a tamper-evident manifest.
+    """
+    user_chat_ids = get_user_chat_ids(user)
+    if user_chat_ids is not None and chat_id not in user_chat_ids:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    def _parse(d: str | None):
+        if not d:
+            return None
+        try:
+            parsed = datetime.fromisoformat(d.replace("Z", "+00:00"))
+            return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Use ISO 8601.")
+
+    try:
+        return await db.build_evidence_package(chat_id, start_date=_parse(start_date), end_date=_parse(end_date))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error building evidence package: {e}", exc_info=True)
+        if _is_db_connection_error(e):
+            raise HTTPException(status_code=503, detail="Database temporarily unavailable")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 @app.get("/api/integrity/status")
 async def get_integrity_status(user: UserContext = Depends(require_auth)):
     """Epic E integrity report: media completeness + broken reply references."""

@@ -55,6 +55,11 @@ def _strip_tz(dt: datetime | None) -> datetime | None:
     return dt
 
 
+def _iso(dt: datetime | None) -> str | None:
+    """Render a datetime as an ISO-8601 string (or None) for serialization."""
+    return dt.isoformat() if dt is not None else None
+
+
 def retry_on_locked(
     max_retries: int = 5, initial_delay: float = 0.1, max_delay: float = 2.0, backoff_factor: float = 2.0
 ):
@@ -2051,6 +2056,114 @@ class DatabaseAdapter:
                 "phone": user.phone,
                 "is_bot": user.is_bot,
             }
+
+    async def build_evidence_package(
+        self, chat_id: int, start_date: datetime | None = None, end_date: datetime | None = None
+    ) -> dict[str, Any]:
+        """PRD §21: build an evidence package for a chat (optionally date-ranged).
+
+        Includes each message with its full edit history (versions), event log,
+        deletion status and media hashes, plus a manifest whose ``content_sha256``
+        is computed over the canonical message content — so any later modification
+        changes the hash (tamper-evident). The manifest timestamp is excluded from
+        the hash to keep it deterministic for identical content.
+        """
+        chat = await self.get_chat_by_id(chat_id)
+        async with self.db_manager.async_session_factory() as session:
+            conditions = [Message.chat_id == chat_id]
+            if start_date is not None:
+                conditions.append(Message.date >= _strip_tz(start_date))
+            if end_date is not None:
+                conditions.append(Message.date <= _strip_tz(end_date))
+            msgs = list(
+                (
+                    await session.execute(
+                        select(Message).where(and_(*conditions)).order_by(Message.date.asc(), Message.id.asc())
+                    )
+                ).scalars()
+            )
+
+            versions = list(
+                (
+                    await session.execute(
+                        select(MessageVersion)
+                        .where(MessageVersion.chat_id == chat_id)
+                        .order_by(MessageVersion.message_id, MessageVersion.version_number)
+                    )
+                ).scalars()
+            )
+            events = list(
+                (
+                    await session.execute(
+                        select(MessageEvent)
+                        .where(MessageEvent.chat_id == chat_id)
+                        .order_by(MessageEvent.message_id, MessageEvent.id)
+                    )
+                ).scalars()
+            )
+            media = list(
+                (await session.execute(select(Media).where(Media.chat_id == chat_id))).scalars()
+            )
+
+        versions_by_msg: dict[int, list] = {}
+        for v in versions:
+            versions_by_msg.setdefault(v.message_id, []).append(
+                {"version_number": v.version_number, "text": v.text, "content_hash": v.content_hash}
+            )
+        events_by_msg: dict[int, list] = {}
+        for e in events:
+            events_by_msg.setdefault(e.message_id, []).append(
+                {"event_type": e.event_type, "event_date": _iso(e.event_date)}
+            )
+        media_by_msg: dict[int, list] = {}
+        for m in media:
+            media_by_msg.setdefault(m.message_id, []).append(
+                {"file_name": m.file_name, "content_hash": m.content_hash, "file_size": m.file_size}
+            )
+
+        messages = []
+        for msg in msgs:
+            messages.append(
+                {
+                    "id": msg.id,
+                    "date": _iso(msg.date),
+                    "sender_id": msg.sender_id,
+                    "text": msg.text,
+                    "edit_date": _iso(msg.edit_date),
+                    "is_deleted_in_telegram": msg.is_deleted_in_telegram,
+                    "deleted_detected_at": _iso(msg.deleted_detected_at),
+                    "versions": versions_by_msg.get(msg.id, []),
+                    "events": events_by_msg.get(msg.id, []),
+                    "media": media_by_msg.get(msg.id, []),
+                }
+            )
+
+        canonical = json.dumps(messages, sort_keys=True, ensure_ascii=False, default=str)
+        content_sha256 = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+        try:
+            from importlib.metadata import version as _pkg_version
+
+            system_version = _pkg_version("telegram-archive")
+        except Exception:
+            system_version = "unknown"
+
+        return {
+            "chat": {"id": chat_id, "title": (chat or {}).get("title"), "type": (chat or {}).get("type")},
+            "messages": messages,
+            "manifest": {
+                "message_count": len(messages),
+                "content_sha256": content_sha256,
+                "generated_at": datetime.utcnow().isoformat(),
+                "date_range": {"start": _iso(start_date), "end": _iso(end_date)},
+                "system_version": system_version,
+                "non_modification_statement": (
+                    "This package was exported directly from the local sovereign archive database. "
+                    "content_sha256 is computed over the canonical message content; any later change "
+                    "to the exported content will produce a different hash."
+                ),
+            },
+        }
 
     async def get_messages_for_export(self, chat_id: int, include_media: bool = False):
         """
