@@ -1529,6 +1529,96 @@ class TestSovereignHistoryEndpoints(_WebTestBase):
 
 
 @_skip_unless_web
+class TestIntegrityStatusEndpoint(_WebTestBase):
+    """Epic E: integrity report endpoint."""
+
+    async def test_integrity_status_aggregates_media_and_reply_checks(self):
+        self.mock_db.get_media_integrity_summary = AsyncMock(
+            return_value={"total": 3, "downloaded": 1, "failed": 1, "skipped": 1, "incomplete": 2}
+        )
+        self.mock_db.get_broken_reply_references = AsyncMock(
+            return_value=[{"id": 3, "chat_id": -100, "reply_to_msg_id": 999}]
+        )
+        async with self._client() as client:
+            resp = await client.get("/api/integrity/status")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["media"]["incomplete"], 2)
+        self.assertEqual(data["broken_reply_references"], 1)
+
+
+@_skip_unless_web
+class TestGlobalSearchEndpoint(_WebTestBase):
+    """Cross-chat search endpoint with filter passthrough and scope enforcement."""
+
+    async def test_search_passes_filters_to_db(self):
+        self.mock_db.search_messages = AsyncMock(
+            return_value=[{"id": 2, "chat_id": -100, "chat_title": "Deals", "has_media": True}]
+        )
+        async with self._client() as client:
+            resp = await client.get("/api/search?query=usdt&media_only=true&deleted_only=false")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()[0]["id"], 2)
+        kwargs = self.mock_db.search_messages.await_args.kwargs
+        self.assertEqual(kwargs["query"], "usdt")
+        self.assertTrue(kwargs["media_only"])
+        self.assertFalse(kwargs["deleted_only"])
+
+    async def test_search_restricts_results_to_user_scope(self):
+        """A scoped viewer must not see hits from chats outside their allowlist."""
+        web_main.AUTH_ENABLED = True
+        token = "scoped-search"
+        web_main._sessions[token] = web_main.SessionData(
+            username="v", role="viewer", created_at=time.time(), allowed_chat_ids={-100}
+        )
+        self.mock_db.search_messages = AsyncMock(
+            return_value=[
+                {"id": 1, "chat_id": -100, "chat_title": "Deals", "has_media": False},
+                {"id": 9, "chat_id": -200, "chat_title": "Secret", "has_media": False},
+            ]
+        )
+        async with self._client() as client:
+            resp = await client.get("/api/search?query=x", cookies={"viewer_auth": token})
+        self.assertEqual(resp.status_code, 200)
+        chat_ids = {h["chat_id"] for h in resp.json()}
+        self.assertEqual(chat_ids, {-100})
+
+
+@_skip_unless_web
+class TestMessageContextEndpoint(_WebTestBase):
+    """UC-05 context endpoint with access control and window clamping."""
+
+    async def test_context_endpoint_returns_window(self):
+        self.mock_db.get_message_context = AsyncMock(
+            return_value=[{"id": 4}, {"id": 5}, {"id": 6}]
+        )
+        async with self._client() as client:
+            resp = await client.get("/api/chats/-100/messages/5/context?window=1")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual([m["id"] for m in resp.json()], [4, 5, 6])
+        self.mock_db.get_message_context.assert_awaited_once_with(-100, 5, window=1)
+
+    async def test_context_endpoint_clamps_window(self):
+        """window is bounded so a viewer cannot request an unbounded scan."""
+        self.mock_db.get_message_context = AsyncMock(return_value=[])
+        async with self._client() as client:
+            resp = await client.get("/api/chats/-100/messages/5/context?window=100000")
+        self.assertEqual(resp.status_code, 422)
+
+    async def test_context_endpoint_denies_out_of_scope(self):
+        web_main.AUTH_ENABLED = True
+        token = "scoped"
+        web_main._sessions[token] = web_main.SessionData(
+            username="v", role="viewer", created_at=time.time(), allowed_chat_ids={999}
+        )
+        self.mock_db.get_message_context = AsyncMock(return_value=[])
+        async with self._client() as client:
+            resp = await client.get("/api/chats/-100/messages/5/context", cookies={"viewer_auth": token})
+        self.assertEqual(resp.status_code, 403)
+        self.mock_db.get_message_context.assert_not_called()
+
+
+@_skip_unless_web
 class TestSovereignStatusEndpoint(_WebTestBase):
     """Dashboard endpoint summarizing the evidence-grade guarantees."""
 

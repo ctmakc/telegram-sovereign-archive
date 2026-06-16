@@ -20,6 +20,7 @@ from typing import Any
 from sqlalchemy import and_, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.orm import aliased
 
 from .base import DatabaseManager
 from .models import (
@@ -546,6 +547,50 @@ class DatabaseAdapter:
             message = (await session.execute(stmt)).scalar_one_or_none()
             return self._message_to_dict(message) if message else None
 
+    async def get_message_context(
+        self, chat_id: int, message_id: int, window: int = 50
+    ) -> list[dict[str, Any]]:
+        """Return a target message with up to ``window`` messages before and after
+        it (chronological order). Deleted-in-Telegram messages are included so any
+        preserved message can be opened in context (UC-05). Empty list if absent.
+        """
+        async with self.db_manager.async_session_factory() as session:
+            target = (
+                await session.execute(
+                    select(Message).where(and_(Message.chat_id == chat_id, Message.id == message_id))
+                )
+            ).scalar_one_or_none()
+            if target is None:
+                return []
+
+            td, tid = target.date, target.id
+            before_stmt = (
+                select(Message)
+                .where(
+                    and_(
+                        Message.chat_id == chat_id,
+                        or_(Message.date < td, and_(Message.date == td, Message.id < tid)),
+                    )
+                )
+                .order_by(Message.date.desc(), Message.id.desc())
+                .limit(window)
+            )
+            after_stmt = (
+                select(Message)
+                .where(
+                    and_(
+                        Message.chat_id == chat_id,
+                        or_(Message.date > td, and_(Message.date == td, Message.id > tid)),
+                    )
+                )
+                .order_by(Message.date.asc(), Message.id.asc())
+                .limit(window)
+            )
+            before = list((await session.execute(before_stmt)).scalars())
+            after = list((await session.execute(after_stmt)).scalars())
+            ordered = list(reversed(before)) + [target] + after
+            return [self._message_to_dict(m) for m in ordered]
+
     async def mark_message_deleted(self, chat_id: int, message_id: int) -> bool:
         """Tombstone a message deleted on Telegram WITHOUT removing local data.
 
@@ -711,6 +756,31 @@ class DatabaseAdapter:
                 }
                 for v in result.scalars()
             ]
+
+    async def get_broken_reply_references(
+        self, chat_id: int | None = None, limit: int = 1000
+    ) -> list[dict[str, Any]]:
+        """Integrity check (PRD §19.3): messages whose reply_to_msg_id points at a
+        message not present locally in the same chat. Surfaces gaps in the archive.
+        """
+        async with self.db_manager.async_session_factory() as session:
+            target = aliased(Message)
+            target_exists = (
+                select(target.id)
+                .where(and_(target.chat_id == Message.chat_id, target.id == Message.reply_to_msg_id))
+                .exists()
+            )
+            conditions = [Message.reply_to_msg_id.isnot(None), ~target_exists]
+            if chat_id is not None:
+                conditions.append(Message.chat_id == chat_id)
+            stmt = (
+                select(Message.id, Message.chat_id, Message.reply_to_msg_id)
+                .where(and_(*conditions))
+                .order_by(Message.chat_id, Message.id)
+                .limit(limit)
+            )
+            result = await session.execute(stmt)
+            return [{"id": r.id, "chat_id": r.chat_id, "reply_to_msg_id": r.reply_to_msg_id} for r in result]
 
     async def get_sovereign_stats(self) -> dict[str, int]:
         """Counters proving the append-only guarantees: preserved deletions and
@@ -1504,6 +1574,87 @@ class DatabaseAdapter:
                         logger.error(f"Failed to delete avatar {avatar_file}: {e}")
 
     # ========== Web Viewer Operations ==========
+
+    async def search_messages(
+        self,
+        query: str | None = None,
+        chat_id: int | None = None,
+        deleted_only: bool = False,
+        edited_only: bool = False,
+        media_only: bool = False,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Cross-chat search with explicit, non-destructive filters (§15).
+
+        All filters are opt-in AND-combined; nothing is silently excluded. Returns
+        message dicts enriched with chat_title, sender name, and a has_media flag.
+        Tombstoned (deleted-in-Telegram) and edited messages are searchable.
+        """
+        async with self.db_manager.async_session_factory() as session:
+            media_exists = (
+                select(Media.id)
+                .where(and_(Media.message_id == Message.id, Media.chat_id == Message.chat_id))
+                .exists()
+            )
+            stmt = (
+                select(
+                    Message,
+                    Chat.title.label("chat_title"),
+                    User.first_name,
+                    User.last_name,
+                    User.username,
+                    media_exists.label("has_media"),
+                )
+                .outerjoin(Chat, Chat.id == Message.chat_id)
+                .outerjoin(User, User.id == Message.sender_id)
+            )
+
+            conditions = []
+            if query:
+                escaped = query.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+                conditions.append(Message.text.ilike(f"%{escaped}%", escape="\\"))
+            if chat_id is not None:
+                conditions.append(Message.chat_id == chat_id)
+            if deleted_only:
+                conditions.append(Message.is_deleted_in_telegram == 1)
+            if edited_only:
+                # "edited" = we captured a prior version (more reliable than
+                # edit_date, which Telegram does not always supply).
+                version_exists = (
+                    select(MessageVersion.id)
+                    .where(
+                        and_(
+                            MessageVersion.message_id == Message.id,
+                            MessageVersion.chat_id == Message.chat_id,
+                        )
+                    )
+                    .exists()
+                )
+                conditions.append(version_exists)
+            if media_only:
+                conditions.append(media_exists)
+            if start_date is not None:
+                conditions.append(Message.date >= _strip_tz(start_date))
+            if end_date is not None:
+                conditions.append(Message.date <= _strip_tz(end_date))
+            if conditions:
+                stmt = stmt.where(and_(*conditions))
+
+            stmt = stmt.order_by(Message.date.desc(), Message.id.desc()).limit(limit).offset(offset)
+
+            result = await session.execute(stmt)
+            hits = []
+            for row in result:
+                msg = self._message_to_dict(row.Message)
+                msg["chat_title"] = row.chat_title
+                name = " ".join(p for p in (row.first_name, row.last_name) if p) or row.username
+                msg["sender_name"] = name
+                msg["has_media"] = bool(row.has_media)
+                hits.append(msg)
+            return hits
 
     async def get_messages_paginated(
         self,
