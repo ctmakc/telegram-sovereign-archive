@@ -712,6 +712,35 @@ class DatabaseAdapter:
                 for v in result.scalars()
             ]
 
+    async def get_sovereign_stats(self) -> dict[str, int]:
+        """Counters proving the append-only guarantees: preserved deletions and
+        edit history. Drives the dashboard's evidence-grade panel.
+        """
+        async with self.db_manager.async_session_factory() as session:
+            deleted_preserved = (
+                await session.execute(
+                    select(func.count()).select_from(Message).where(Message.is_deleted_in_telegram == 1)
+                )
+            ).scalar() or 0
+            total_versions = (
+                await session.execute(select(func.count()).select_from(MessageVersion))
+            ).scalar() or 0
+            distinct_msgs = (
+                select(MessageVersion.message_id, MessageVersion.chat_id).distinct().subquery()
+            )
+            messages_with_history = (
+                await session.execute(select(func.count()).select_from(distinct_msgs))
+            ).scalar() or 0
+            events_total = (
+                await session.execute(select(func.count()).select_from(MessageEvent))
+            ).scalar() or 0
+            return {
+                "deleted_preserved": deleted_preserved,
+                "messages_with_history": messages_with_history,
+                "total_versions": total_versions,
+                "events_total": events_total,
+            }
+
     async def backfill_is_outgoing(self, owner_id: int) -> None:
         """Backfill is_outgoing flag for messages sent by the owner."""
         async with self.db_manager.async_session_factory() as session:

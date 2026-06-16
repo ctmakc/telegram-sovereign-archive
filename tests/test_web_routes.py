@@ -1528,5 +1528,31 @@ class TestSovereignHistoryEndpoints(_WebTestBase):
         self.mock_db.get_message_versions.assert_not_called()
 
 
+@_skip_unless_web
+class TestSovereignStatusEndpoint(_WebTestBase):
+    """Dashboard endpoint summarizing the evidence-grade guarantees."""
+
+    async def test_status_returns_sovereign_and_media_summary(self):
+        self.mock_db.get_sovereign_stats = AsyncMock(
+            return_value={
+                "deleted_preserved": 2,
+                "messages_with_history": 1,
+                "total_versions": 3,
+                "events_total": 5,
+            }
+        )
+        self.mock_db.get_media_integrity_summary = AsyncMock(
+            return_value={"total": 4, "downloaded": 2, "failed": 1, "skipped": 1, "incomplete": 2}
+        )
+        async with self._client() as client:
+            resp = await client.get("/api/sovereign/status")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["deleted_preserved"], 2)
+        self.assertEqual(data["total_versions"], 3)
+        self.assertEqual(data["media"]["failed"], 1)
+        self.assertEqual(data["media"]["incomplete"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()
