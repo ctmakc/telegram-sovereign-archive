@@ -1445,6 +1445,101 @@ async def get_messages(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@app.get("/api/integrity/status")
+async def get_integrity_status(user: UserContext = Depends(require_auth)):
+    """Epic E integrity report: media completeness + broken reply references."""
+    try:
+        media = await db.get_media_integrity_summary()
+        broken = await db.get_broken_reply_references()
+        return {"media": media, "broken_reply_references": len(broken)}
+    except Exception as e:
+        logger.error(f"Error fetching integrity status: {e}", exc_info=True)
+        if _is_db_connection_error(e):
+            raise HTTPException(status_code=503, detail="Database temporarily unavailable")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.get("/api/search")
+async def search_messages_endpoint(
+    user: UserContext = Depends(require_auth),
+    query: str | None = None,
+    chat_id: int | None = None,
+    deleted_only: bool = False,
+    edited_only: bool = False,
+    media_only: bool = False,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """§15/UC-04: cross-chat search with explicit filters. Results are always
+    restricted to the caller's accessible chats (scope enforced server-side).
+    """
+    user_chat_ids = get_user_chat_ids(user)
+    if chat_id is not None and user_chat_ids is not None and chat_id not in user_chat_ids:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    def _parse(d: str | None):
+        if not d:
+            return None
+        try:
+            parsed = datetime.fromisoformat(d.replace("Z", "+00:00"))
+            return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Use ISO 8601.")
+
+    try:
+        results = await db.search_messages(
+            query=query,
+            chat_id=chat_id,
+            deleted_only=deleted_only,
+            edited_only=edited_only,
+            media_only=media_only,
+            start_date=_parse(start_date),
+            end_date=_parse(end_date),
+            limit=limit,
+            offset=offset,
+        )
+        if user_chat_ids is not None:
+            results = [r for r in results if r.get("chat_id") in user_chat_ids]
+        if user.no_download:
+            _strip_original_media_paths(results)
+        return results
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error searching messages: {e}", exc_info=True)
+        if _is_db_connection_error(e):
+            raise HTTPException(status_code=503, detail="Database temporarily unavailable")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.get("/api/chats/{chat_id}/messages/{message_id}/context")
+async def get_message_context_window(
+    chat_id: int,
+    message_id: int,
+    user: UserContext = Depends(require_auth),
+    window: int = Query(50, ge=1, le=500),
+):
+    """UC-05: open a message with surrounding context (±window messages,
+    chronological). Includes deleted-in-Telegram messages so any preserved
+    message is openable in place.
+    """
+    user_chat_ids = get_user_chat_ids(user)
+    if user_chat_ids is not None and chat_id not in user_chat_ids:
+        raise HTTPException(status_code=403, detail="Access denied")
+    try:
+        messages = await db.get_message_context(chat_id, message_id, window=window)
+        if user.no_download:
+            _strip_original_media_paths(messages)
+        return messages
+    except Exception as e:
+        logger.error(f"Error fetching message context: {e}", exc_info=True)
+        if _is_db_connection_error(e):
+            raise HTTPException(status_code=503, detail="Database temporarily unavailable")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 @app.get("/api/sovereign/status")
 async def get_sovereign_status(user: UserContext = Depends(require_auth)):
     """Evidence-grade dashboard summary: how much local truth the archive has

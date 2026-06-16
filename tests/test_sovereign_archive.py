@@ -185,6 +185,135 @@ class TestMessageVersioning:
         assert await adapter.get_message_versions(-100, 1) == []
 
 
+class TestMessageContext:
+    """UC-05: open any message with N messages of surrounding context."""
+
+    async def _seed_run(self, adapter, n, chat_id=-100):
+        await adapter.upsert_chat({"id": chat_id, "type": "supergroup", "title": "T"})
+        for i in range(1, n + 1):
+            await adapter.insert_message(
+                {"id": i, "chat_id": chat_id, "date": datetime(2026, 6, 15, 12, i, tzinfo=UTC), "text": f"m{i}"}
+            )
+
+    @pytest.mark.asyncio
+    async def test_context_returns_window_around_target(self, adapter):
+        await self._seed_run(adapter, 10)
+        ctx = await adapter.get_message_context(-100, 5, window=2)
+        assert [m["id"] for m in ctx] == [3, 4, 5, 6, 7]
+
+    @pytest.mark.asyncio
+    async def test_context_clamps_at_start_boundary(self, adapter):
+        await self._seed_run(adapter, 5)
+        ctx = await adapter.get_message_context(-100, 1, window=2)
+        assert [m["id"] for m in ctx] == [1, 2, 3]
+
+    @pytest.mark.asyncio
+    async def test_context_missing_message_returns_empty(self, adapter):
+        await adapter.upsert_chat({"id": -100, "type": "supergroup", "title": "T"})
+        assert await adapter.get_message_context(-100, 999, window=2) == []
+
+    @pytest.mark.asyncio
+    async def test_context_includes_deleted_target(self, adapter):
+        """A deleted-in-Telegram message must still be openable in context."""
+        await self._seed_run(adapter, 5)
+        await adapter.mark_message_deleted(-100, 3)
+        ctx = await adapter.get_message_context(-100, 3, window=1)
+        target = next(m for m in ctx if m["id"] == 3)
+        assert target["is_deleted_in_telegram"] == 1
+        assert [m["id"] for m in ctx] == [2, 3, 4]
+
+
+class TestGlobalSearch:
+    """§15/UC-04: cross-chat search with explicit, non-destructive filters."""
+
+    async def _seed(self, adapter):
+        for cid, title in ((-100, "Deals"), (-200, "Family")):
+            await adapter.upsert_chat({"id": cid, "type": "supergroup", "title": title})
+        # -100: deal chat
+        await adapter.insert_message(
+            {"id": 1, "chat_id": -100, "date": datetime(2026, 6, 1, tzinfo=UTC), "text": "invoice for Poland deal"}
+        )
+        await adapter.insert_message(
+            {"id": 2, "chat_id": -100, "date": datetime(2026, 6, 2, tzinfo=UTC), "text": "payment in USDT"}
+        )
+        await adapter.insert_media(
+            {"id": "f1", "message_id": 2, "chat_id": -100, "type": "document", "downloaded": 1}
+        )
+        # -200: family chat (also mentions 'deal' to prove cross-chat)
+        await adapter.insert_message(
+            {"id": 1, "chat_id": -200, "date": datetime(2026, 6, 3, tzinfo=UTC), "text": "great deal on groceries"}
+        )
+        # edited + deleted markers
+        await adapter.record_message_edit(-100, 1, "invoice for Poland deal (signed)", None)
+        await adapter.mark_message_deleted(-200, 1)
+
+    @pytest.mark.asyncio
+    async def test_query_matches_across_chats(self, adapter):
+        await self._seed(adapter)
+        hits = await adapter.search_messages(query="deal")
+        keys = {(h["chat_id"], h["id"]) for h in hits}
+        assert (-100, 1) in keys and (-200, 1) in keys
+        # chat title is surfaced for context
+        titles = {h["chat_title"] for h in hits}
+        assert {"Deals", "Family"} <= titles
+
+    @pytest.mark.asyncio
+    async def test_deleted_only_filter(self, adapter):
+        await self._seed(adapter)
+        hits = await adapter.search_messages(deleted_only=True)
+        assert {(h["chat_id"], h["id"]) for h in hits} == {(-200, 1)}
+
+    @pytest.mark.asyncio
+    async def test_edited_only_filter(self, adapter):
+        await self._seed(adapter)
+        hits = await adapter.search_messages(edited_only=True)
+        assert {(h["chat_id"], h["id"]) for h in hits} == {(-100, 1)}
+
+    @pytest.mark.asyncio
+    async def test_media_only_filter(self, adapter):
+        await self._seed(adapter)
+        hits = await adapter.search_messages(media_only=True)
+        assert {(h["chat_id"], h["id"]) for h in hits} == {(-100, 2)}
+        assert all(h["has_media"] for h in hits)
+
+    @pytest.mark.asyncio
+    async def test_chat_scope_and_date_range(self, adapter):
+        await self._seed(adapter)
+        hits = await adapter.search_messages(
+            chat_id=-100, start_date=datetime(2026, 6, 2, tzinfo=UTC)
+        )
+        assert {(h["chat_id"], h["id"]) for h in hits} == {(-100, 2)}
+
+
+class TestIntegrityChecks:
+    """Epic E: data-integrity checks (PRD §19.3)."""
+
+    @pytest.mark.asyncio
+    async def test_broken_reply_references_detected(self, adapter):
+        await adapter.upsert_chat({"id": -100, "type": "supergroup", "title": "T"})
+        base = datetime(2026, 6, 15, tzinfo=UTC)
+        await adapter.insert_message({"id": 1, "chat_id": -100, "date": base, "text": "root"})
+        await adapter.insert_message(
+            {"id": 2, "chat_id": -100, "date": base, "text": "valid reply", "reply_to_msg_id": 1}
+        )
+        await adapter.insert_message(
+            {"id": 3, "chat_id": -100, "date": base, "text": "dangling", "reply_to_msg_id": 999}
+        )
+        broken = await adapter.get_broken_reply_references()
+        assert {b["id"] for b in broken} == {3}
+        assert broken[0]["reply_to_msg_id"] == 999
+
+    @pytest.mark.asyncio
+    async def test_no_broken_references_when_all_resolve(self, adapter):
+        await adapter.upsert_chat({"id": -100, "type": "supergroup", "title": "T"})
+        base = datetime(2026, 6, 15, tzinfo=UTC)
+        await adapter.insert_message({"id": 1, "chat_id": -100, "date": base, "text": "root"})
+        await adapter.insert_message(
+            {"id": 2, "chat_id": -100, "date": base, "text": "reply", "reply_to_msg_id": 1}
+        )
+        assert await adapter.get_broken_reply_references() == []
+
+
 class TestSovereignStats:
     """Dashboard counters proving the append-only guarantees are working."""
 
