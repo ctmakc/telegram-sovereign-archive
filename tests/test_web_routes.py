@@ -1487,5 +1487,46 @@ class TestRealtimeNotificationWithPush(_WebTestBase):
         self.assertEqual(call_kwargs["sender_name"], "Alice")
 
 
+@_skip_unless_web
+class TestSovereignHistoryEndpoints(_WebTestBase):
+    """Endpoints exposing append-only message history (versions + event log)."""
+
+    async def test_versions_endpoint_returns_history(self):
+        self.mock_db.get_message_versions = AsyncMock(
+            return_value=[
+                {"version_number": 1, "text": "A", "edit_date": None, "content_hash": "h", "captured_at": None}
+            ]
+        )
+        async with self._client() as client:
+            resp = await client.get("/api/chats/-100/messages/5/versions")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["text"], "A")
+        self.mock_db.get_message_versions.assert_awaited_once_with(-100, 5)
+
+    async def test_events_endpoint_returns_log(self):
+        self.mock_db.get_message_events = AsyncMock(
+            return_value=[{"id": 1, "event_type": "deleted", "event_date": None, "captured_at": None, "raw_json": None}]
+        )
+        async with self._client() as client:
+            resp = await client.get("/api/chats/-100/messages/5/events")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()[0]["event_type"], "deleted")
+        self.mock_db.get_message_events.assert_awaited_once_with(-100, 5)
+
+    async def test_versions_endpoint_denies_chat_outside_scope(self):
+        web_main.AUTH_ENABLED = True
+        token = "viewer-scoped-token"
+        web_main._sessions[token] = web_main.SessionData(
+            username="v1", role="viewer", created_at=time.time(), allowed_chat_ids={999}
+        )
+        self.mock_db.get_message_versions = AsyncMock(return_value=[])
+        async with self._client() as client:
+            resp = await client.get("/api/chats/-100/messages/5/versions", cookies={"viewer_auth": token})
+        self.assertEqual(resp.status_code, 403)
+        self.mock_db.get_message_versions.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

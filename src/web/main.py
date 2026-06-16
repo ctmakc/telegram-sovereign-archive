@@ -1445,6 +1445,48 @@ async def get_messages(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@app.get("/api/chats/{chat_id}/messages/{message_id}/versions")
+async def get_message_version_history(
+    chat_id: int, message_id: int, user: UserContext = Depends(require_auth)
+):
+    """Sovereign archive: return the preserved prior-text versions of a message.
+
+    Every edit snapshots the prior text before overwriting the live row, so the
+    full history is recoverable here (oldest version first).
+    """
+    user_chat_ids = get_user_chat_ids(user)
+    if user_chat_ids is not None and chat_id not in user_chat_ids:
+        raise HTTPException(status_code=403, detail="Access denied")
+    try:
+        return await db.get_message_versions(chat_id, message_id)
+    except Exception as e:
+        logger.error(f"Error fetching message versions: {e}", exc_info=True)
+        if _is_db_connection_error(e):
+            raise HTTPException(status_code=503, detail="Database temporarily unavailable")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.get("/api/chats/{chat_id}/messages/{message_id}/events")
+async def get_message_event_log(
+    chat_id: int, message_id: int, user: UserContext = Depends(require_auth)
+):
+    """Sovereign archive: return the append-only event log for a message.
+
+    Includes created/edited/deleted/... events — e.g. a 'deleted' event marks a
+    message that was removed on Telegram but preserved locally.
+    """
+    user_chat_ids = get_user_chat_ids(user)
+    if user_chat_ids is not None and chat_id not in user_chat_ids:
+        raise HTTPException(status_code=403, detail="Access denied")
+    try:
+        return await db.get_message_events(chat_id, message_id)
+    except Exception as e:
+        logger.error(f"Error fetching message events: {e}", exc_info=True)
+        if _is_db_connection_error(e):
+            raise HTTPException(status_code=503, detail="Database temporarily unavailable")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 @app.get("/api/chats/{chat_id}/pinned")
 async def get_pinned_messages(chat_id: int, user: UserContext = Depends(require_auth)):
     """Get all pinned messages for a chat, ordered by date descending (newest first)."""
