@@ -1266,7 +1266,11 @@ class TelegramBackup:
                 for msg_id, remote_msg in zip(batch_ids, remote_messages):
                     # Check for deletion
                     if remote_msg is None:
-                        await self.db.delete_message(chat_id, msg_id)
+                        # SAFE_ARCHIVE_MODE: tombstone (preserve + flag) instead of destroy.
+                        if self.config.safe_archive_mode:
+                            await self.db.mark_message_deleted(chat_id, msg_id)
+                        else:
+                            await self.db.delete_message(chat_id, msg_id)
                         total_deleted += 1
                         continue
 
@@ -1284,8 +1288,15 @@ class TelegramBackup:
                             should_update = True
 
                     if should_update:
-                        # Update text and edit_date
-                        await self.db.update_message_text(chat_id, msg_id, remote_msg.message, remote_msg.edit_date)
+                        # SAFE_ARCHIVE_MODE: snapshot prior text into message_versions.
+                        if self.config.safe_archive_mode:
+                            await self.db.record_message_edit(
+                                chat_id, msg_id, remote_msg.message, remote_msg.edit_date
+                            )
+                        else:
+                            await self.db.update_message_text(
+                                chat_id, msg_id, remote_msg.message, remote_msg.edit_date
+                            )
                         total_updated += 1
 
             except Exception as e:

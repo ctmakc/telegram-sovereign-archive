@@ -20,7 +20,7 @@ Covers lines missing from the initial test_listener.py:
 
 import asyncio
 import os
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -52,6 +52,7 @@ def _make_config(**overrides):
     config.validate_credentials = MagicMock()
     config.whitelist_mode = False
     config.chat_ids = set()
+    config.safe_archive_mode = True
     config.listen_edits = True
     config.listen_deletions = True
     config.listen_new_messages = True
@@ -76,6 +77,8 @@ def _make_db():
     db.get_all_chats = AsyncMock(return_value=[])
     db.update_message_text = AsyncMock()
     db.delete_message = AsyncMock()
+    db.record_message_edit = AsyncMock()
+    db.mark_message_deleted = AsyncMock()
     db.resolve_message_chat_id = AsyncMock(return_value=None)
     db.upsert_chat = AsyncMock()
     db.upsert_user = AsyncMock()
@@ -1559,6 +1562,70 @@ class TestOnMessageDeletedRateLimiting:
 
         # Both messages skip the inner should_process_chat check
         db.delete_message.assert_not_called()
+
+
+class TestSovereignListenerRouting:
+    """Edits and deletions must route through append-only methods under SAFE_ARCHIVE_MODE."""
+
+    async def test_edit_under_safe_mode_versions_instead_of_overwrites(self):
+        listener, handlers, db, config = _make_listener_with_handlers(safe_archive_mode=True)
+        handler = handlers[events.MessageEdited]
+        event = MagicMock()
+        event.chat_id = -1001234567890
+        msg = MagicMock()
+        msg.reply_to = None
+        msg.id = 42
+        msg.text = "edited"
+        msg.edit_date = datetime(2026, 1, 1, tzinfo=UTC)
+        event.message = msg
+
+        await handler(event)
+
+        db.record_message_edit.assert_awaited_once()
+        db.update_message_text.assert_not_called()
+
+    async def test_edit_without_safe_mode_overwrites_legacy_path(self):
+        listener, handlers, db, config = _make_listener_with_handlers(safe_archive_mode=False)
+        handler = handlers[events.MessageEdited]
+        event = MagicMock()
+        event.chat_id = -1001234567890
+        msg = MagicMock()
+        msg.reply_to = None
+        msg.id = 42
+        msg.text = "edited"
+        msg.edit_date = datetime(2026, 1, 1, tzinfo=UTC)
+        event.message = msg
+
+        await handler(event)
+
+        db.update_message_text.assert_awaited_once()
+        db.record_message_edit.assert_not_called()
+
+    async def test_deletion_under_safe_mode_tombstones_instead_of_deleting(self):
+        listener, handlers, db, config = _make_listener_with_handlers(safe_archive_mode=True)
+        handler = handlers[events.MessageDeleted]
+        listener._tracked_chat_ids = {-1001234567890}
+        event = MagicMock()
+        event.chat_id = -1001234567890
+        event.deleted_ids = [7]
+
+        await handler(event)
+
+        db.mark_message_deleted.assert_awaited_once_with(-1001234567890, 7)
+        db.delete_message.assert_not_called()
+
+    async def test_deletion_without_safe_mode_hard_deletes_legacy_path(self):
+        listener, handlers, db, config = _make_listener_with_handlers(safe_archive_mode=False)
+        handler = handlers[events.MessageDeleted]
+        listener._tracked_chat_ids = {-1001234567890}
+        event = MagicMock()
+        event.chat_id = -1001234567890
+        event.deleted_ids = [7]
+
+        await handler(event)
+
+        db.delete_message.assert_awaited_once_with(-1001234567890, 7)
+        db.mark_message_deleted.assert_not_called()
 
 
 # ===========================================================================

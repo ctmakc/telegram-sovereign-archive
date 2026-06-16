@@ -282,6 +282,10 @@ class TelegramListener:
         logger.info("=" * 70)
         logger.info("🛡️ TelegramListener initialized with ZERO-FOOTPRINT PROTECTION")
         logger.info("=" * 70)
+        if getattr(config, "safe_archive_mode", True):
+            logger.info("  🗄️ SAFE_ARCHIVE_MODE: true - deletions tombstoned, edits versioned (append-only)")
+        else:
+            logger.warning("  ⚠️ SAFE_ARCHIVE_MODE: false - destructive mirror (deletions/edits overwrite local data)")
         logger.info(f"  LISTEN_EDITS: {config.listen_edits}")
         if config.listen_deletions:
             logger.warning("  ⚠️ LISTEN_DELETIONS: true - Deletions will be processed (with protection)")
@@ -702,10 +706,16 @@ class TelegramListener:
                     self.stats["operations_discarded"] += 1
                     return
 
-                # Apply the edit immediately
-                await self.db.update_message_text(
-                    chat_id=chat_id, message_id=message.id, new_text=new_text, edit_date=edit_date
-                )
+                # Apply the edit. Under SAFE_ARCHIVE_MODE the prior text is
+                # snapshotted into message_versions before the live row changes.
+                if self.config.safe_archive_mode:
+                    await self.db.record_message_edit(
+                        chat_id=chat_id, message_id=message.id, new_text=new_text, edit_date=edit_date
+                    )
+                else:
+                    await self.db.update_message_text(
+                        chat_id=chat_id, message_id=message.id, new_text=new_text, edit_date=edit_date
+                    )
                 self.stats["edits_applied"] += 1
                 logger.debug(f"📝 Edit applied: chat={chat_id} msg={message.id}")
 
@@ -771,7 +781,10 @@ class TelegramListener:
                                 self.stats["operations_discarded"] += 1
                                 continue
 
-                            await self.db.delete_message(resolved, msg_id)
+                            if self.config.safe_archive_mode:
+                                await self.db.mark_message_deleted(resolved, msg_id)
+                            else:
+                                await self.db.delete_message(resolved, msg_id)
                             self.stats["deletions_applied"] += 1
                             logger.debug(f"🗑️ Deletion applied (resolved chat): chat={resolved} msg={msg_id}")
 
@@ -791,8 +804,12 @@ class TelegramListener:
                         self.stats["operations_discarded"] += 1
                         continue
 
-                    # Apply the deletion immediately
-                    await self.db.delete_message(effective_chat_id, msg_id)
+                    # Apply the deletion. Under SAFE_ARCHIVE_MODE this tombstones
+                    # the local row (preserved + flagged) instead of removing it.
+                    if self.config.safe_archive_mode:
+                        await self.db.mark_message_deleted(effective_chat_id, msg_id)
+                    else:
+                        await self.db.delete_message(effective_chat_id, msg_id)
                     self.stats["deletions_applied"] += 1
                     logger.debug(f"🗑️ Deletion applied: chat={effective_chat_id} msg={msg_id}")
 

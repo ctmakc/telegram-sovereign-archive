@@ -84,6 +84,12 @@ class Message(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, server_default=func.now())
     is_outgoing: Mapped[int] = mapped_column(Integer, default=0)  # 0 or 1
     is_pinned: Mapped[int] = mapped_column(Integer, default=0)  # 0 or 1 - whether this message is pinned
+    # Sovereign archive (append-only): a Telegram deletion sets these flags but
+    # NEVER removes the row. See message_versions for edit history.
+    is_deleted_in_telegram: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    deleted_detected_at: Mapped[datetime | None] = mapped_column(DateTime)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, server_default=func.now())
 
     # Relationships
     chat: Mapped[Chat] = relationship("Chat", back_populates="messages")
@@ -109,6 +115,59 @@ class Message(Base):
         Index("idx_messages_reply_to", "chat_id", "reply_to_msg_id"),
         # v6.2.0: Index for topic message lookups in forum chats
         Index("idx_messages_topic", "chat_id", "reply_to_top_id"),
+        # Sovereign: fast lookup of messages deleted-in-Telegram-but-preserved
+        Index("idx_messages_deleted", "chat_id", "is_deleted_in_telegram"),
+    )
+
+
+class MessageVersion(Base):
+    """Append-only history of a message's text.
+
+    Sovereign archive: before the live ``messages.text`` is overwritten by an
+    edit, the prior value is snapshotted here so no version is ever lost.
+    Intentionally has NO foreign key to ``messages`` — versions are evidence and
+    must survive even a hard delete of the live row.
+    """
+
+    __tablename__ = "message_versions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False)  # 1 = oldest captured
+    text: Mapped[str | None] = mapped_column(Text)
+    edit_date: Mapped[datetime | None] = mapped_column(DateTime)
+    content_hash: Mapped[str | None] = mapped_column(String(64))  # SHA-256 of text
+    raw_json: Mapped[str | None] = mapped_column(Text)
+    captured_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("message_id", "chat_id", "version_number", name="uq_message_version"),
+        Index("idx_message_versions_msg", "chat_id", "message_id"),
+    )
+
+
+class MessageEvent(Base):
+    """Append-only event log for message mutations.
+
+    event_type: created / edited / deleted / pinned / unpinned /
+    reaction_changed / media_downloaded / media_failed.
+    No foreign key — events are evidence and outlive the live row.
+    """
+
+    __tablename__ = "message_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    event_date: Mapped[datetime | None] = mapped_column(DateTime)
+    raw_json: Mapped[str | None] = mapped_column(Text)
+    captured_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_message_events_msg", "chat_id", "message_id"),
+        Index("idx_message_events_type", "event_type"),
     )
 
 
