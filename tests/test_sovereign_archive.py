@@ -460,6 +460,60 @@ class TestMediaFileVerification:
         assert report["missing"] == []
 
 
+class TestEntityStorage:
+    """Epic F/G: deterministic entity extraction stored + searchable."""
+
+    async def _msg(self, adapter, mid, text, chat_id=-100):
+        await adapter.upsert_chat({"id": chat_id, "type": "supergroup", "title": "T"})
+        await adapter.insert_message(
+            {"id": mid, "chat_id": chat_id, "date": datetime(2026, 6, 15, tzinfo=UTC), "text": text}
+        )
+
+    @pytest.mark.asyncio
+    async def test_store_and_search_entities(self, adapter):
+        await self._msg(adapter, 1, "mail a@b.com pay 5000 USDT")
+        await adapter.store_message_entities(-100, 1, "mail a@b.com pay 5000 USDT")
+        emails = await adapter.search_entities(entity_type="email")
+        assert [e["value"] for e in emails] == ["a@b.com"]
+        assert emails[0]["mention_count"] == 1
+        amounts = await adapter.search_entities(entity_type="amount")
+        assert any("USDT" in a["value"] for a in amounts)
+
+    @pytest.mark.asyncio
+    async def test_same_value_dedups_to_one_entity_with_two_mentions(self, adapter):
+        await self._msg(adapter, 1, "ping a@b.com")
+        await self._msg(adapter, 2, "again a@b.com")
+        await adapter.store_message_entities(-100, 1, "ping a@b.com")
+        await adapter.store_message_entities(-100, 2, "again a@b.com")
+        emails = await adapter.search_entities(entity_type="email")
+        assert len(emails) == 1
+        assert emails[0]["mention_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_reextract_is_idempotent(self, adapter):
+        await self._msg(adapter, 1, "a@b.com")
+        await adapter.store_message_entities(-100, 1, "a@b.com")
+        await adapter.store_message_entities(-100, 1, "a@b.com")  # re-run
+        emails = await adapter.search_entities(entity_type="email")
+        assert emails[0]["mention_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_entity_messages_timeline(self, adapter):
+        await self._msg(adapter, 7, "wallet 0x52908400098527886E0F7030069857D2E4169EE7")
+        await adapter.store_message_entities(-100, 7, "wallet 0x52908400098527886E0F7030069857D2E4169EE7")
+        wallets = await adapter.search_entities(entity_type="crypto_wallet")
+        mentions = await adapter.get_entity_messages(wallets[0]["id"])
+        assert (-100, 7) in {(m["chat_id"], m["message_id"]) for m in mentions}
+
+    @pytest.mark.asyncio
+    async def test_backfill_scans_existing_messages(self, adapter):
+        await self._msg(adapter, 1, "contact x@y.com")
+        await self._msg(adapter, 2, "no entities here")
+        count = await adapter.backfill_entities()
+        assert count >= 1
+        assert len(await adapter.search_entities(entity_type="email")) == 1
+
+
 class TestSovereignStats:
     """Dashboard counters proving the append-only guarantees are working."""
 

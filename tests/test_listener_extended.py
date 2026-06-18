@@ -1614,6 +1614,33 @@ class TestSovereignListenerRouting:
         db.mark_message_deleted.assert_awaited_once_with(-1001234567890, 7)
         db.delete_message.assert_not_called()
 
+    async def test_new_message_triggers_entity_extraction(self):
+        listener, handlers, db, config = _make_listener_with_handlers()
+        handler = handlers[events.NewMessage]
+        event = MagicMock()
+        event.chat_id = -1001234567890
+        msg = MagicMock()
+        msg.reply_to = None
+        msg.id = 77
+        msg.sender_id = 111
+        msg.date = datetime(2026, 1, 1)
+        msg.text = "mail me a@b.com"
+        msg.reply_to_msg_id = None
+        msg.edit_date = None
+        msg.out = False
+        msg.grouped_id = None
+        msg.media = None
+        msg.sender = None
+        event.message = msg
+        event.get_chat = AsyncMock(return_value=MagicMock())
+
+        await handler(event)
+
+        db.store_message_entities.assert_awaited_once()
+        args = db.store_message_entities.await_args.args
+        assert args[0] == -1001234567890 and args[1] == 77
+        assert args[2] == "mail me a@b.com"
+
     async def test_deletion_without_safe_mode_hard_deletes_legacy_path(self):
         listener, handlers, db, config = _make_listener_with_handlers(safe_archive_mode=False)
         handler = handlers[events.MessageDeleted]

@@ -912,6 +912,13 @@ class TelegramListener:
                 await self.db.insert_message(message_data)
                 self.stats["new_messages_saved"] += 1
 
+                # Sovereign: extract entities (email/url/phone/wallet/amount) from the
+                # new message. Best-effort — never let it break real-time ingest.
+                try:
+                    await self.db.store_message_entities(chat_id, message.id, message_data.get("text"))
+                except Exception:
+                    logger.debug("Entity extraction failed for new message", exc_info=True)
+
                 # v6.0.0: Handle media - create Media record AFTER message exists
                 if media_type:
                     # Download media immediately if enabled
