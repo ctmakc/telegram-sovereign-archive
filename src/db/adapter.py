@@ -1607,6 +1607,9 @@ class DatabaseAdapter:
         deleted_only: bool = False,
         edited_only: bool = False,
         media_only: bool = False,
+        media_type: str | None = None,
+        sender_id: int | None = None,
+        has_link: bool = False,
         start_date: datetime | None = None,
         end_date: datetime | None = None,
         limit: int = 50,
@@ -1675,6 +1678,25 @@ class DatabaseAdapter:
                 conditions.append(version_exists)
             if media_only:
                 conditions.append(media_exists)
+            if media_type is not None:
+                conditions.append(
+                    select(Media.id)
+                    .where(
+                        and_(
+                            Media.message_id == Message.id,
+                            Media.chat_id == Message.chat_id,
+                            Media.type == media_type,
+                        )
+                    )
+                    .exists()
+                )
+            if sender_id is not None:
+                conditions.append(Message.sender_id == sender_id)
+            if has_link:
+                # Cheap heuristic: any http(s) URL in the text.
+                conditions.append(
+                    or_(Message.text.ilike("%http://%"), Message.text.ilike("%https://%"))
+                )
             if start_date is not None:
                 conditions.append(Message.date >= _strip_tz(start_date))
             if end_date is not None:

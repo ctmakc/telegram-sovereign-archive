@@ -1529,6 +1529,39 @@ class TestSovereignHistoryEndpoints(_WebTestBase):
 
 
 @_skip_unless_web
+class TestJsonlExportEndpoint(_WebTestBase):
+    """MVP DoD: export raw archive to JSONL (one message object per line)."""
+
+    async def test_jsonl_export_streams_one_object_per_line(self):
+        self.mock_db.build_evidence_package = AsyncMock(
+            return_value={
+                "chat": {"id": -100, "title": "Deals"},
+                "messages": [{"id": 1, "text": "a"}, {"id": 2, "text": "b"}],
+                "manifest": {"message_count": 2, "content_sha256": "h"},
+            }
+        )
+        async with self._client() as client:
+            resp = await client.get("/api/export/jsonl?chat_id=-100")
+        self.assertEqual(resp.status_code, 200)
+        lines = [ln for ln in resp.text.splitlines() if ln.strip()]
+        self.assertEqual(len(lines), 3)  # 2 message lines + trailing manifest line
+        self.assertEqual(json.loads(lines[0])["id"], 1)
+        self.assertEqual(json.loads(lines[-1])["_manifest"]["message_count"], 2)
+
+    async def test_jsonl_export_denies_out_of_scope(self):
+        web_main.AUTH_ENABLED = True
+        token = "scoped-jsonl"
+        web_main._sessions[token] = web_main.SessionData(
+            username="v", role="viewer", created_at=time.time(), allowed_chat_ids={999}
+        )
+        self.mock_db.build_evidence_package = AsyncMock(return_value={})
+        async with self._client() as client:
+            resp = await client.get("/api/export/jsonl?chat_id=-100", cookies={"viewer_auth": token})
+        self.assertEqual(resp.status_code, 403)
+        self.mock_db.build_evidence_package.assert_not_called()
+
+
+@_skip_unless_web
 class TestEvidenceExportEndpoint(_WebTestBase):
     """PRD §21 evidence export endpoint, gated to accessible chats."""
 
