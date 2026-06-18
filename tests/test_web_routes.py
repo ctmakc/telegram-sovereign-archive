@@ -1577,6 +1577,38 @@ class TestIntegrityStatusEndpoint(_WebTestBase):
         data = resp.json()
         self.assertEqual(data["media"]["incomplete"], 2)
         self.assertEqual(data["broken_reply_references"], 1)
+        self.assertNotIn("missing_media_files", data)  # FS scan is opt-in
+
+    async def test_integrity_status_runs_fs_scan_when_requested(self):
+        self.mock_db.get_media_integrity_summary = AsyncMock(return_value={"total": 0})
+        self.mock_db.get_broken_reply_references = AsyncMock(return_value=[])
+        self.mock_db.verify_media_files = AsyncMock(
+            return_value={"checked": 5, "missing": [{"id": "x"}], "missing_count": 1}
+        )
+        async with self._client() as client:
+            resp = await client.get("/api/integrity/status?verify_files=true")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["missing_media_files"], 1)
+        self.mock_db.verify_media_files.assert_awaited_once()
+
+
+@_skip_unless_web
+class TestRetryQueueEndpoint(_WebTestBase):
+    """Epic B: the media retry queue must be inspectable."""
+
+    async def test_retry_queue_lists_failed_media(self):
+        self.mock_db.get_failed_media = AsyncMock(
+            return_value=[
+                {"id": "a", "download_status": "failed", "download_attempts": 2, "last_download_error": "timeout"}
+            ]
+        )
+        async with self._client() as client:
+            resp = await client.get("/api/media/retry-queue")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["items"][0]["last_download_error"], "timeout")
 
 
 @_skip_unless_web

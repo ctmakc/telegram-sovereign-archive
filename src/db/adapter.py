@@ -1116,6 +1116,26 @@ class DatabaseAdapter:
                 for m in result.scalars()
             ]
 
+    async def verify_media_files(self, media_root: str | None = None) -> dict[str, Any]:
+        """Integrity check (PRD §19.3): confirm every media record that should have
+        a file on disk actually does. Reports records whose file is missing.
+
+        ``file_path`` may be absolute or relative to ``media_root``. A broken
+        symlink (target gone) counts as missing. Bounded by media-row count — does
+        not walk the filesystem, so orphan detection is out of scope here.
+        """
+        records = await self.get_media_for_verification()
+        missing = []
+        for rec in records:
+            path = rec.get("file_path")
+            if not path:
+                missing.append({"id": rec["id"], "file_path": None, "reason": "no file_path recorded"})
+                continue
+            resolved = path if os.path.isabs(path) else os.path.join(media_root or "", path)
+            if not os.path.exists(resolved):
+                missing.append({"id": rec["id"], "file_path": path, "reason": "file not found on disk"})
+        return {"checked": len(records), "missing": missing, "missing_count": len(missing)}
+
     async def iter_media_paths_for_repair(self, batch_size: int = 500):
         """Yield ``(id, file_path, file_name)`` batches for the #175 repair pass.
 
@@ -1620,7 +1640,21 @@ class DatabaseAdapter:
             conditions = []
             if query:
                 escaped = query.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
-                conditions.append(Message.text.ilike(f"%{escaped}%", escape="\\"))
+                like = f"%{escaped}%"
+                # Match the live text OR any preserved prior version — exact search
+                # must still find text that was later edited away (Phase 2/4 AC).
+                version_text_match = (
+                    select(MessageVersion.id)
+                    .where(
+                        and_(
+                            MessageVersion.message_id == Message.id,
+                            MessageVersion.chat_id == Message.chat_id,
+                            MessageVersion.text.ilike(like, escape="\\"),
+                        )
+                    )
+                    .exists()
+                )
+                conditions.append(or_(Message.text.ilike(like, escape="\\"), version_text_match))
             if chat_id is not None:
                 conditions.append(Message.chat_id == chat_id)
             if deleted_only:
@@ -1658,6 +1692,9 @@ class DatabaseAdapter:
                 name = " ".join(p for p in (row.first_name, row.last_name) if p) or row.username
                 msg["sender_name"] = name
                 msg["has_media"] = bool(row.has_media)
+                # True when the query matched only a preserved prior version (the
+                # live text no longer contains it) — i.e. edited-away evidence.
+                msg["matched_historical"] = bool(query) and query.lower() not in (msg.get("text") or "").lower()
                 hits.append(msg)
             return hits
 
