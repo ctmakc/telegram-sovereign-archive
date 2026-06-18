@@ -22,12 +22,15 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import aliased
 
+from ..entities import extract_entities
 from .base import DatabaseManager
 from .models import (
     AppSettings,
     Chat,
     ChatFolder,
     ChatFolderMember,
+    Entity,
+    EntityMention,
     ForumTopic,
     Media,
     Message,
@@ -786,6 +789,126 @@ class DatabaseAdapter:
             )
             result = await session.execute(stmt)
             return [{"id": r.id, "chat_id": r.chat_id, "reply_to_msg_id": r.reply_to_msg_id} for r in result]
+
+    async def store_message_entities(self, chat_id: int, message_id: int, text: str | None) -> int:
+        """Extract entities from ``text`` and store them (idempotent per message).
+
+        Entities are deduplicated by (type, normalized_value); each occurrence
+        becomes an EntityMention. Re-running replaces this message's mentions, so
+        an edited message re-extracts cleanly. Returns the number of mentions.
+        """
+        entities = extract_entities(text)
+        async with self.db_manager.async_session_factory() as session:
+            # Idempotency: drop this message's existing mentions before re-adding.
+            await session.execute(
+                delete(EntityMention).where(
+                    and_(EntityMention.chat_id == chat_id, EntityMention.message_id == message_id)
+                )
+            )
+            for e in entities:
+                existing = (
+                    await session.execute(
+                        select(Entity).where(
+                            and_(
+                                Entity.entity_type == e["entity_type"],
+                                Entity.normalized_value == e["normalized_value"],
+                            )
+                        )
+                    )
+                ).scalar_one_or_none()
+                if existing is None:
+                    existing = Entity(
+                        entity_type=e["entity_type"],
+                        value=e["value"],
+                        normalized_value=e["normalized_value"],
+                    )
+                    session.add(existing)
+                    await session.flush()  # assign id
+                session.add(
+                    EntityMention(
+                        entity_id=existing.id,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        offset_start=e["offset_start"],
+                        offset_end=e["offset_end"],
+                    )
+                )
+            await session.commit()
+            return len(entities)
+
+    async def search_entities(
+        self, entity_type: str | None = None, query: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """List extracted entities (with mention counts), filterable by type/value.
+
+        Only entities with at least one mention are returned, ordered by frequency.
+        """
+        async with self.db_manager.async_session_factory() as session:
+            stmt = (
+                select(
+                    Entity.id,
+                    Entity.entity_type,
+                    Entity.value,
+                    Entity.normalized_value,
+                    func.count(EntityMention.id).label("mention_count"),
+                )
+                .join(EntityMention, EntityMention.entity_id == Entity.id)
+                .group_by(Entity.id, Entity.entity_type, Entity.value, Entity.normalized_value)
+            )
+            if entity_type is not None:
+                stmt = stmt.where(Entity.entity_type == entity_type)
+            if query:
+                escaped = query.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+                stmt = stmt.where(Entity.normalized_value.ilike(f"%{escaped}%", escape="\\"))
+            stmt = stmt.order_by(func.count(EntityMention.id).desc(), Entity.id.asc()).limit(limit)
+            result = await session.execute(stmt)
+            return [
+                {
+                    "id": r.id,
+                    "entity_type": r.entity_type,
+                    "value": r.value,
+                    "normalized_value": r.normalized_value,
+                    "mention_count": int(r.mention_count),
+                }
+                for r in result
+            ]
+
+    async def get_entity_messages(self, entity_id: int) -> list[dict[str, Any]]:
+        """Return the messages that mention a given entity (its timeline)."""
+        async with self.db_manager.async_session_factory() as session:
+            stmt = (
+                select(EntityMention)
+                .where(EntityMention.entity_id == entity_id)
+                .order_by(EntityMention.chat_id, EntityMention.message_id)
+            )
+            result = await session.execute(stmt)
+            return [
+                {
+                    "chat_id": m.chat_id,
+                    "message_id": m.message_id,
+                    "offset_start": m.offset_start,
+                    "offset_end": m.offset_end,
+                }
+                for m in result.scalars()
+            ]
+
+    async def backfill_entities(self) -> int:
+        """Extract entities from all existing messages that have text.
+
+        Returns the number of messages that yielded at least one entity.
+        """
+        async with self.db_manager.async_session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(Message.chat_id, Message.id, Message.text).where(Message.text.isnot(None))
+                )
+            ).all()
+        processed = 0
+        for chat_id, message_id, msg_text in rows:
+            n = await self.store_message_entities(chat_id, message_id, msg_text)
+            if n:
+                processed += 1
+        return processed
 
     async def get_sovereign_stats(self) -> dict[str, int]:
         """Counters proving the append-only guarantees: preserved deletions and

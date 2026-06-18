@@ -1627,6 +1627,41 @@ class TestIntegrityStatusEndpoint(_WebTestBase):
 
 
 @_skip_unless_web
+class TestEntitiesEndpoints(_WebTestBase):
+    """Epic F/G: extracted-entity search + per-entity message timeline."""
+
+    async def test_entities_list_passes_filters(self):
+        self.mock_db.search_entities = AsyncMock(
+            return_value=[{"id": 1, "entity_type": "email", "value": "a@b.com",
+                           "normalized_value": "a@b.com", "mention_count": 2}]
+        )
+        async with self._client() as client:
+            resp = await client.get("/api/entities?entity_type=email&query=a")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()[0]["mention_count"], 2)
+        kwargs = self.mock_db.search_entities.await_args.kwargs
+        self.assertEqual(kwargs["entity_type"], "email")
+        self.assertEqual(kwargs["query"], "a")
+
+    async def test_entity_timeline_scoped_to_accessible_chats(self):
+        web_main.AUTH_ENABLED = True
+        token = "scoped-ent"
+        web_main._sessions[token] = web_main.SessionData(
+            username="v", role="viewer", created_at=time.time(), allowed_chat_ids={-100}
+        )
+        self.mock_db.get_entity_messages = AsyncMock(
+            return_value=[
+                {"chat_id": -100, "message_id": 1},
+                {"chat_id": -200, "message_id": 9},
+            ]
+        )
+        async with self._client() as client:
+            resp = await client.get("/api/entities/5/messages", cookies={"viewer_auth": token})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual({m["chat_id"] for m in resp.json()}, {-100})
+
+
+@_skip_unless_web
 class TestRetryQueueEndpoint(_WebTestBase):
     """Epic B: the media retry queue must be inspectable."""
 

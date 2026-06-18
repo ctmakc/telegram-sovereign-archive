@@ -171,6 +171,45 @@ class MessageEvent(Base):
     )
 
 
+class Entity(Base):
+    """Distinct entity extracted from message text (email/url/phone/wallet/amount).
+
+    Deduplicated by (entity_type, normalized_value); each occurrence is an
+    EntityMention. Deterministic regex extraction — see src/entities.py.
+    """
+
+    __tablename__ = "entities"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    entity_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_value: Mapped[str] = mapped_column(String(512), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("entity_type", "normalized_value", name="uq_entity"),
+        Index("idx_entities_type", "entity_type"),
+    )
+
+
+class EntityMention(Base):
+    """One occurrence of an entity inside a specific message (with offsets)."""
+
+    __tablename__ = "entity_mentions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    entity_id: Mapped[int] = mapped_column(Integer, ForeignKey("entities.id", ondelete="CASCADE"), nullable=False)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    offset_start: Mapped[int | None] = mapped_column(Integer)
+    offset_end: Mapped[int | None] = mapped_column(Integer)
+
+    __table_args__ = (
+        Index("idx_entity_mentions_entity", "entity_id"),
+        Index("idx_entity_mentions_msg", "chat_id", "message_id"),
+    )
+
+
 class User(Base):
     """Users table - message senders."""
 

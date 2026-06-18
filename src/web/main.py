@@ -1530,6 +1530,43 @@ async def get_integrity_status(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@app.get("/api/entities")
+async def list_entities(
+    user: UserContext = Depends(require_master),
+    entity_type: str | None = None,
+    query: str | None = None,
+    limit: int = Query(100, ge=1, le=500),
+):
+    """Epic F/G: extracted entities (email/url/phone/wallet/amount) with mention
+    counts. Cross-chat, so gated to master.
+    """
+    try:
+        return await db.search_entities(entity_type=entity_type, query=query, limit=limit)
+    except Exception as e:
+        logger.error(f"Error listing entities: {e}", exc_info=True)
+        if _is_db_connection_error(e):
+            raise HTTPException(status_code=503, detail="Database temporarily unavailable")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.get("/api/entities/{entity_id}/messages")
+async def get_entity_timeline(entity_id: int, user: UserContext = Depends(require_auth)):
+    """Messages mentioning an entity (its timeline). Restricted to the caller's
+    accessible chats.
+    """
+    user_chat_ids = get_user_chat_ids(user)
+    try:
+        mentions = await db.get_entity_messages(entity_id)
+        if user_chat_ids is not None:
+            mentions = [m for m in mentions if m.get("chat_id") in user_chat_ids]
+        return mentions
+    except Exception as e:
+        logger.error(f"Error fetching entity timeline: {e}", exc_info=True)
+        if _is_db_connection_error(e):
+            raise HTTPException(status_code=503, detail="Database temporarily unavailable")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 @app.get("/api/media/retry-queue")
 async def get_media_retry_queue(user: UserContext = Depends(require_auth)):
     """Epic B: media downloads that failed and are awaiting retry (with the last
