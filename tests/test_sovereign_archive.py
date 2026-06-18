@@ -284,6 +284,30 @@ class TestGlobalSearch:
         )
         assert {(h["chat_id"], h["id"]) for h in hits} == {(-100, 2)}
 
+    @pytest.mark.asyncio
+    async def test_query_finds_text_from_old_versions(self, adapter):
+        """Phase 2/4 AC: exact search must find text that was later edited away."""
+        await adapter.upsert_chat({"id": -100, "type": "supergroup", "title": "Deals"})
+        await adapter.insert_message(
+            {"id": 1, "chat_id": -100, "date": datetime(2026, 6, 1, tzinfo=UTC), "text": "pay 5000 USDT"}
+        )
+        await adapter.record_message_edit(-100, 1, "cancelled", None)
+
+        # live text no longer mentions USDT, but the deal evidence must still surface
+        hits = await adapter.search_messages(query="USDT")
+        assert {(h["chat_id"], h["id"]) for h in hits} == {(-100, 1)}
+        hit = hits[0]
+        assert hit["matched_historical"] is True  # flag: matched only in an old version
+
+    @pytest.mark.asyncio
+    async def test_live_match_not_flagged_historical(self, adapter):
+        await adapter.upsert_chat({"id": -100, "type": "supergroup", "title": "Deals"})
+        await adapter.insert_message(
+            {"id": 1, "chat_id": -100, "date": datetime(2026, 6, 1, tzinfo=UTC), "text": "pay 5000 USDT"}
+        )
+        hits = await adapter.search_messages(query="USDT")
+        assert hits[0]["matched_historical"] is False
+
 
 class TestEvidenceExport:
     """PRD §21: evidence package with tamper-evident hash manifest."""
@@ -364,6 +388,47 @@ class TestIntegrityChecks:
             {"id": 2, "chat_id": -100, "date": base, "text": "reply", "reply_to_msg_id": 1}
         )
         assert await adapter.get_broken_reply_references() == []
+
+
+class TestMediaFileVerification:
+    """Epic E (PRD §19.3): verify DB media records against files on disk."""
+
+    @pytest.mark.asyncio
+    async def test_detects_missing_files(self, adapter, tmp_path):
+        present = tmp_path / "present.bin"
+        present.write_bytes(b"data")
+        gone = tmp_path / "gone.bin"  # never created
+        await adapter.upsert_chat({"id": -100, "type": "supergroup", "title": "T"})
+        await adapter.insert_message(
+            {"id": 1, "chat_id": -100, "date": datetime(2026, 6, 15, tzinfo=UTC), "text": "m"}
+        )
+        await adapter.insert_media(
+            {"id": "ok", "message_id": 1, "chat_id": -100, "type": "document",
+             "file_path": str(present), "downloaded": True}
+        )
+        await adapter.insert_media(
+            {"id": "missing", "message_id": 1, "chat_id": -100, "type": "document",
+             "file_path": str(gone), "downloaded": True}
+        )
+
+        report = await adapter.verify_media_files(str(tmp_path))
+        assert report["checked"] == 2
+        assert {m["id"] for m in report["missing"]} == {"missing"}
+
+    @pytest.mark.asyncio
+    async def test_clean_archive_reports_no_missing(self, adapter, tmp_path):
+        f = tmp_path / "f.bin"
+        f.write_bytes(b"x")
+        await adapter.upsert_chat({"id": -100, "type": "supergroup", "title": "T"})
+        await adapter.insert_message(
+            {"id": 1, "chat_id": -100, "date": datetime(2026, 6, 15, tzinfo=UTC), "text": "m"}
+        )
+        await adapter.insert_media(
+            {"id": "ok", "message_id": 1, "chat_id": -100, "type": "document",
+             "file_path": str(f), "downloaded": True}
+        )
+        report = await adapter.verify_media_files(str(tmp_path))
+        assert report["missing"] == []
 
 
 class TestSovereignStats:

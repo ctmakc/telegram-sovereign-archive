@@ -1480,14 +1480,41 @@ async def export_evidence(
 
 
 @app.get("/api/integrity/status")
-async def get_integrity_status(user: UserContext = Depends(require_auth)):
-    """Epic E integrity report: media completeness + broken reply references."""
+async def get_integrity_status(
+    user: UserContext = Depends(require_auth),
+    verify_files: bool = False,
+):
+    """Epic E integrity report: media completeness + broken reply references.
+
+    Pass ?verify_files=true to also scan the filesystem for DB-referenced media
+    files that are missing on disk (opt-in — bounded by media-row count).
+    """
     try:
         media = await db.get_media_integrity_summary()
         broken = await db.get_broken_reply_references()
-        return {"media": media, "broken_reply_references": len(broken)}
+        result = {"media": media, "broken_reply_references": len(broken)}
+        if verify_files:
+            scan = await db.verify_media_files(config.media_path)
+            result["missing_media_files"] = scan["missing_count"]
+            result["missing_media_sample"] = scan["missing"][:50]
+        return result
     except Exception as e:
         logger.error(f"Error fetching integrity status: {e}", exc_info=True)
+        if _is_db_connection_error(e):
+            raise HTTPException(status_code=503, detail="Database temporarily unavailable")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.get("/api/media/retry-queue")
+async def get_media_retry_queue(user: UserContext = Depends(require_auth)):
+    """Epic B: media downloads that failed and are awaiting retry (with the last
+    error and attempt count) so incomplete archive items stay visible.
+    """
+    try:
+        items = await db.get_failed_media()
+        return {"count": len(items), "items": items}
+    except Exception as e:
+        logger.error(f"Error fetching retry queue: {e}", exc_info=True)
         if _is_db_connection_error(e):
             raise HTTPException(status_code=503, detail="Database temporarily unavailable")
         raise HTTPException(status_code=500, detail="Internal server error")
