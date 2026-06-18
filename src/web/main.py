@@ -1445,6 +1445,31 @@ async def get_messages(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@app.get("/api/export/jsonl")
+async def export_jsonl(chat_id: int, user: UserContext = Depends(require_auth)):
+    """MVP DoD: export a chat as JSONL — one message object per line, plus a
+    trailing line with the export manifest (incl. tamper-evident content hash).
+    """
+    user_chat_ids = get_user_chat_ids(user)
+    if user_chat_ids is not None and chat_id not in user_chat_ids:
+        raise HTTPException(status_code=403, detail="Access denied")
+    try:
+        package = await db.build_evidence_package(chat_id)
+    except Exception as e:
+        logger.error(f"Error building JSONL export: {e}", exc_info=True)
+        if _is_db_connection_error(e):
+            raise HTTPException(status_code=503, detail="Database temporarily unavailable")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+    def _lines():
+        for msg in package.get("messages", []):
+            yield json.dumps(msg, ensure_ascii=False, default=str) + "\n"
+        yield json.dumps({"_manifest": package.get("manifest", {})}, ensure_ascii=False, default=str) + "\n"
+
+    headers = {"Content-Disposition": f'attachment; filename="chat_{chat_id}.jsonl"'}
+    return StreamingResponse(_lines(), media_type="application/x-ndjson", headers=headers)
+
+
 @app.get("/api/export/evidence")
 async def export_evidence(
     chat_id: int,
@@ -1528,6 +1553,9 @@ async def search_messages_endpoint(
     deleted_only: bool = False,
     edited_only: bool = False,
     media_only: bool = False,
+    media_type: str | None = None,
+    sender_id: int | None = None,
+    has_link: bool = False,
     start_date: str | None = None,
     end_date: str | None = None,
     limit: int = Query(50, ge=1, le=200),
@@ -1556,6 +1584,9 @@ async def search_messages_endpoint(
             deleted_only=deleted_only,
             edited_only=edited_only,
             media_only=media_only,
+            media_type=media_type,
+            sender_id=sender_id,
+            has_link=has_link,
             start_date=_parse(start_date),
             end_date=_parse(end_date),
             limit=limit,

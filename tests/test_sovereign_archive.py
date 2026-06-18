@@ -300,6 +300,35 @@ class TestGlobalSearch:
         assert hit["matched_historical"] is True  # flag: matched only in an old version
 
     @pytest.mark.asyncio
+    async def test_filter_by_sender(self, adapter):
+        await adapter.upsert_chat({"id": -100, "type": "supergroup", "title": "T"})
+        base = datetime(2026, 6, 1, tzinfo=UTC)
+        await adapter.insert_message({"id": 1, "chat_id": -100, "sender_id": 11, "date": base, "text": "from alice"})
+        await adapter.insert_message({"id": 2, "chat_id": -100, "sender_id": 22, "date": base, "text": "from bob"})
+        hits = await adapter.search_messages(sender_id=11)
+        assert {(h["chat_id"], h["id"]) for h in hits} == {(-100, 1)}
+
+    @pytest.mark.asyncio
+    async def test_filter_by_media_type(self, adapter):
+        await adapter.upsert_chat({"id": -100, "type": "supergroup", "title": "T"})
+        base = datetime(2026, 6, 1, tzinfo=UTC)
+        await adapter.insert_message({"id": 1, "chat_id": -100, "date": base, "text": "voice note"})
+        await adapter.insert_message({"id": 2, "chat_id": -100, "date": base, "text": "a doc"})
+        await adapter.insert_media({"id": "v1", "message_id": 1, "chat_id": -100, "type": "voice", "downloaded": 1})
+        await adapter.insert_media({"id": "d1", "message_id": 2, "chat_id": -100, "type": "document", "downloaded": 1})
+        hits = await adapter.search_messages(media_type="voice")
+        assert {(h["chat_id"], h["id"]) for h in hits} == {(-100, 1)}
+
+    @pytest.mark.asyncio
+    async def test_filter_has_link(self, adapter):
+        await adapter.upsert_chat({"id": -100, "type": "supergroup", "title": "T"})
+        base = datetime(2026, 6, 1, tzinfo=UTC)
+        await adapter.insert_message({"id": 1, "chat_id": -100, "date": base, "text": "see https://example.com/x"})
+        await adapter.insert_message({"id": 2, "chat_id": -100, "date": base, "text": "no link here"})
+        hits = await adapter.search_messages(has_link=True)
+        assert {(h["chat_id"], h["id"]) for h in hits} == {(-100, 1)}
+
+    @pytest.mark.asyncio
     async def test_live_match_not_flagged_historical(self, adapter):
         await adapter.upsert_chat({"id": -100, "type": "supergroup", "title": "Deals"})
         await adapter.insert_message(
